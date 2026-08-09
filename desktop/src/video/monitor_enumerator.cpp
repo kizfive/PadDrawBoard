@@ -41,7 +41,14 @@ HRESULT ActiveDisplayTargets(std::vector<DisplayTarget>* targets) {
     DisplayTarget target{};
     target.adapter_luid = path.targetInfo.adapterId;
     target.target_id = path.targetInfo.id;
-    std::wcsncpy(target.gdi_name, source.viewGdiDeviceName, CCHDEVICENAME - 1);
+    constexpr std::size_t kMaxDeviceNameLength = CCHDEVICENAME - 1;
+    std::size_t name_length = 0;
+    while (name_length < kMaxDeviceNameLength &&
+           source.viewGdiDeviceName[name_length] != L'\0') {
+      ++name_length;
+    }
+    std::wmemcpy(target.gdi_name, source.viewGdiDeviceName, name_length);
+    target.gdi_name[name_length] = L'\0';
     targets->push_back(target);
   }
   return S_OK;
@@ -56,10 +63,18 @@ std::wstring MonitorId::ToString() const {
 
 bool MonitorId::TryParse(const std::wstring& value, MonitorId* result) {
   if (result == nullptr) return false;
-  long high{};
-  unsigned long low{};
-  unsigned long output{};
-  if (std::swscanf(value.c_str(), L"%ld:%lu:%lu", &high, &low, &output) != 3) return false;
+  const wchar_t* cursor = value.c_str();
+  wchar_t* end = nullptr;
+  const long high = std::wcstol(cursor, &end, 10);
+  if (end == cursor || *end != L':') return false;
+  cursor = end + 1;
+
+  const unsigned long low = std::wcstoul(cursor, &end, 10);
+  if (end == cursor || *end != L':') return false;
+  cursor = end + 1;
+
+  const unsigned long output = std::wcstoul(cursor, &end, 10);
+  if (end == cursor) return false;
   result->adapter_luid.HighPart = high;
   result->adapter_luid.LowPart = low;
   result->target_id = static_cast<std::uint32_t>(output);

@@ -3,6 +3,7 @@
 #include "pdb/video/desktop_duplication_capture.h"
 #include "pdb/video/h264_encoder.h"
 #include "pdb/video/latest_frame_queue.h"
+#include "pdb/video/monitor_enumerator.h"
 #include "pdb/video/resolution_ladder.h"
 #include "pdb/video/telemetry.h"
 
@@ -379,6 +380,18 @@ void ForceKeyFrameVariantUsesDocumentedUInt32Type() {
   assert(value.ulVal == 1u);
 }
 
+void MonitorIdParsingMatchesSerializedFormat() {
+  MonitorId parsed{};
+  assert(MonitorId::TryParse(L"-1:123:4", &parsed));
+  assert(parsed.adapter_luid.HighPart == -1);
+  assert(parsed.adapter_luid.LowPart == 123u);
+  assert(parsed.target_id == 4u);
+
+  assert(!MonitorId::TryParse(L"-1:123", &parsed));
+  assert(!MonitorId::TryParse(L"-1:x:4", &parsed));
+  assert(!MonitorId::TryParse(L"-1:123:x", &parsed));
+}
+
 }  // namespace pdb::video::test
 
 #if defined(PDB_VIDEO_TEST_MAIN)
@@ -405,5 +418,6 @@ int main() {
   pdb::video::test::PendingEncodeTelemetryCompletionDrivesExactlyOneEncodeAndPolicyCallback();
   pdb::video::test::AnnexBIdrDetectionHandlesStartCodesAndMalformedInput();
   pdb::video::test::ForceKeyFrameVariantUsesDocumentedUInt32Type();
+  pdb::video::test::MonitorIdParsingMatchesSerializedFormat();
 }
 #endif

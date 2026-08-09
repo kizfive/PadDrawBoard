@@ -16,7 +16,7 @@ namespace pdb::input {
 namespace {
 constexpr std::uint32_t kMaxContacts = 10;
 using CreateSyntheticPointerDeviceFn = HSYNTHETICPOINTERDEVICE(WINAPI*)(POINTER_INPUT_TYPE, ULONG, POINTER_FEEDBACK_MODE);
-using InjectSyntheticPointerInputFn = WINBOOL(WINAPI*)(HSYNTHETICPOINTERDEVICE, const POINTER_TYPE_INFO*, UINT32);
+using InjectSyntheticPointerInputFn = BOOL(WINAPI*)(HSYNTHETICPOINTERDEVICE, const POINTER_TYPE_INFO*, UINT32);
 using DestroySyntheticPointerDeviceFn = VOID(WINAPI*)(HSYNTHETICPOINTERDEVICE);
 
 LONG ToPressure(float pressure) noexcept {
