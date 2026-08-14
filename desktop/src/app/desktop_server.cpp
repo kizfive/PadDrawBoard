@@ -1,4 +1,5 @@
 #include "pdb/app/desktop_server.h"
+#include "pdb/app/client_handshake_watchdog.h"
 
 #include "pdb/app/framed_stream.h"
 #include "pdb/app/session_auth.h"
@@ -497,6 +498,7 @@ void DesktopServer::AcceptLoop(std::stop_token stop_token) {
 }
 
 void DesktopServer::AdbLoop(std::stop_token stop_token) {
+  ClientHandshakeWatchdog handshake_watchdog;
   while (!stop_token.stop_requested() && running_.load()) {
     bool probe_attempted = false;
     adb::AdbLocatorOptions options;
@@ -527,6 +529,14 @@ void DesktopServer::AdbLoop(std::stop_token stop_token) {
     while (!stop_token.stop_requested() && running_.load()) {
       adb_session_->Tick();
       const bool connected = adb_session_->connected();
+      if (handshake_watchdog.Observe(
+              connected, session_active_.load(std::memory_order_acquire),
+              std::chrono::steady_clock::now())) {
+        adb_session_->NotifyChannelLoss(
+            "Android client authentication handshake timed out; relaunching with a fresh token");
+        probe_attempted = false;
+        continue;
+      }
       if (connected && !probe_attempted) {
         const adb::DeviceListing selected = client_pointer->SelectSingleAuthorizedDevice(stop_token);
         if (selected.status == adb::DeviceSelectionStatus::Authorized && selected.selected.has_value()) {
@@ -700,7 +710,10 @@ bool DesktopServer::EstablishSession(SOCKET control_socket) {
   mapper.monitor = MonitorRect(monitor);
   mapper.contentAspectRatio = static_cast<float>(chosen_video->first.width) /
                               static_cast<float>(chosen_video->first.height);
-  mapper.rotation = *rotation;
+  // MotionEvent coordinates are already expressed in the currently rotated
+  // Android View. The orientation value only starts a new input epoch; applying
+  // it here would rotate the normalized View coordinates a second time.
+  mapper.rotation = input::Rotation::k0;
   mapper.orientationEpoch = orientation_epoch_;
   if (!input_.Configure(mapper)) {
     std::scoped_lock lock(video_mutex_);
@@ -816,7 +829,9 @@ void DesktopServer::ControlLoop(std::stop_token stop_token, std::uint64_t genera
         mapper.contentAspectRatio = configured_video_size_.height == 0 ? 0.0F :
             static_cast<float>(configured_video_size_.width) /
                 static_cast<float>(configured_video_size_.height);
-        mapper.rotation = *rotation;
+        // The Android View has already transformed MotionEvent coordinates for
+        // the new display orientation. Keep host mapping in View coordinates.
+        mapper.rotation = input::Rotation::k0;
         mapper.orientationEpoch = orientation_epoch_;
         input_.OnOrientationChange(mapper);
         std::scoped_lock adapter_lock(input_adapter_mutex_);
@@ -1204,14 +1219,14 @@ void DesktopServer::OnStreamResetRequested() {
 
 std::wstring ServerPhaseText(ServerPhase phase) {
   switch (phase) {
-    case ServerPhase::kStopped: return L"Stopped";
-    case ServerPhase::kStarting: return L"Starting";
-    case ServerPhase::kAwaitingAdb: return L"Waiting for ADB";
-    case ServerPhase::kAwaitingClient: return L"Waiting for tablet";
-    case ServerPhase::kActive: return L"Active";
-    case ServerPhase::kDegraded: return L"Degraded";
+    case ServerPhase::kStopped: return L"已停止";
+    case ServerPhase::kStarting: return L"正在启动";
+    case ServerPhase::kAwaitingAdb: return L"等待平板连接";
+    case ServerPhase::kAwaitingClient: return L"等待平板客户端";
+    case ServerPhase::kActive: return L"运行正常";
+    case ServerPhase::kDegraded: return L"部分功能不可用";
   }
-  return L"Unknown";
+  return L"未知状态";
 }
 
 }  // namespace pdb::app

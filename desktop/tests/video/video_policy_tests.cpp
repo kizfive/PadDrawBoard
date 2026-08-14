@@ -153,6 +153,42 @@ void OptionalCodecApiPropertyFailuresUseDocumentedDefaults() {
   assert(!IsOptionalH264CodecApiPropertyFailure(E_FAIL));
 }
 
+void EncoderOutputStreamChangesRenegotiateWithBoundedRetries() {
+  assert(ClassifyH264EncoderOutputStatus(S_OK, 0, 0) ==
+         H264EncoderOutputAction::kConsumeOutput);
+  assert(ClassifyH264EncoderOutputStatus(
+             MF_E_TRANSFORM_NEED_MORE_INPUT, 0, 0) ==
+         H264EncoderOutputAction::kNeedMoreInput);
+  assert(ClassifyH264EncoderOutputStatus(
+             MF_E_TRANSFORM_STREAM_CHANGE,
+             MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE, 0) ==
+         H264EncoderOutputAction::kRenegotiateOutput);
+  assert(ClassifyH264EncoderOutputStatus(
+             MF_E_TRANSFORM_STREAM_CHANGE, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
+             kMaxH264EncoderOutputStreamChanges - 1) ==
+         H264EncoderOutputAction::kRenegotiateOutput);
+  assert(ClassifyH264EncoderOutputStatus(
+             MF_E_TRANSFORM_STREAM_CHANGE, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
+             kMaxH264EncoderOutputStreamChanges) ==
+         H264EncoderOutputAction::kFail);
+  assert(ClassifyH264EncoderOutputStatus(
+             MF_E_TRANSFORM_STREAM_CHANGE, 0, 0) ==
+         H264EncoderOutputAction::kRetryOutput);
+  assert(ClassifyH264EncoderOutputStatus(
+             MF_E_TRANSFORM_STREAM_CHANGE,
+             MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, 0) ==
+         H264EncoderOutputAction::kRetryOutput);
+  assert(ClassifyH264EncoderOutputStatus(E_FAIL, 0, 0) ==
+         H264EncoderOutputAction::kFail);
+
+  assert(ShouldRetryEmptyH264EncoderOutput(false, 0));
+  assert(ShouldRetryEmptyH264EncoderOutput(
+      false, kMaxH264EncoderEmptyOutputRetries - 1));
+  assert(!ShouldRetryEmptyH264EncoderOutput(
+      false, kMaxH264EncoderEmptyOutputRetries));
+  assert(!ShouldRetryEmptyH264EncoderOutput(true, 0));
+}
+
 void LatestFrameQueueReplacesOnlyPendingRawFrame() {
   LatestFrameQueue<std::string> queue;
   queue.Push("old");
@@ -216,6 +252,28 @@ void AsyncMftAssociatesOutputAndHandlesStaleOutputEvents() {
   state.OnEvent(AsyncMftEvent::kHaveOutput);
   const auto stale_sequence = state.OnOutputProduced();
   assert(!stale_sequence.has_value());
+}
+
+void AsyncMftStreamChangeConsumesCurrentOutputEventAndKeepsPendingInput() {
+  AsyncMftStateMachine state;
+  state.StartStream();
+  state.OnEvent(AsyncMftEvent::kNeedInput);
+  assert(state.OnInputAccepted(29));
+  state.OnEvent(AsyncMftEvent::kHaveOutput);
+  assert(state.HasOutput());
+
+  // ProcessOutput reported STREAM_CHANGE and the caller renegotiated the
+  // output type. That HaveOutput event is consumed without completing the
+  // pending frame; a second event is required before ProcessOutput is legal.
+  state.OnOutputUnavailable();
+  assert(!state.HasOutput());
+  assert(state.HasPendingInput());
+  assert(state.pending_sequence().has_value() && *state.pending_sequence() == 29);
+
+  state.OnEvent(AsyncMftEvent::kHaveOutput);
+  const auto sequence = state.OnOutputProduced();
+  assert(sequence.has_value() && *sequence == 29);
+  assert(!state.HasPendingInput());
 }
 
 void AsyncMftDrainAndFailureSuppressFurtherInput() {
@@ -404,11 +462,13 @@ int main() {
   pdb::video::test::EncoderSelectionUsesDeterministicTieBreak();
   pdb::video::test::EncoderFormalStreamSetupRequiresTypesBeforeStart();
   pdb::video::test::OptionalCodecApiPropertyFailuresUseDocumentedDefaults();
+  pdb::video::test::EncoderOutputStreamChangesRenegotiateWithBoundedRetries();
   pdb::video::test::LatestFrameQueueReplacesOnlyPendingRawFrame();
   pdb::video::test::LatestFrameQueuePreservesNewerFrameWhenRetryingAsyncInput();
   pdb::video::test::BackpressureRequiresResetAndFreshIdr();
   pdb::video::test::AsyncMftRequiresNeedInputAndKeepsOnlyOneFrameInFlight();
   pdb::video::test::AsyncMftAssociatesOutputAndHandlesStaleOutputEvents();
+  pdb::video::test::AsyncMftStreamChangeConsumesCurrentOutputEventAndKeepsPendingInput();
   pdb::video::test::AsyncMftDrainAndFailureSuppressFurtherInput();
   pdb::video::test::PendingEncodeTelemetryCompletesDelayedOutputExactlyOnce();
   pdb::video::test::EncodedAccessUnitCarriesSynchronousCaptureAndEncodeTimes();

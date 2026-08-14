@@ -8,11 +8,13 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import android.os.SystemClock
+import android.util.Log
 
 /** Connects device loopback ports that adb reverse maps to the desktop listeners. */
 class AdbSession(private val listener: Listener, sessionToken: ByteArray) : AutoCloseable {
@@ -20,6 +22,8 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
     private val codec = PdbCodec(); private val running = AtomicBoolean(); private val reconnecting = AtomicBoolean()
     private val sessionToken = sessionToken.clone()
     private val executor = Executors.newScheduledThreadPool(3); private val sockets = CopyOnWriteArraySet<Socket>()
+    private val inputExecutor = Executors.newSingleThreadExecutor()
+    private val controlExecutor = Executors.newSingleThreadExecutor()
     private val controlSequence = AtomicLong(); private val inputSequence = AtomicLong()
     private val controlLock = Any(); private val inputLock = Any()
     private val telemetryClock = TelemetryClock { SystemClock.elapsedRealtimeNanos() }
@@ -59,21 +63,35 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
     fun sendInput(samples: List<CapturedInputSample>, width: Int, height: Int) {
         if (samples.isEmpty()) return
         val stream = input ?: return
-        synchronized(inputLock) {
-            if (input !== stream) return
-            runCatching {
-                // Keep MotionEvent history ordered while respecting the protocol limit.
-                samples.chunked(PdbProtocol.MAX_INPUT_SAMPLES).forEach { chunk ->
-                    codec.write(stream, codec.input(chunk, width, height, inputSequence.incrementAndGet()))
+        val pendingSamples = samples.toList()
+        try {
+            inputExecutor.execute {
+                synchronized(inputLock) {
+                    if (input !== stream) return@synchronized
+                    runCatching {
+                        // Keep MotionEvent history ordered while respecting the protocol limit.
+                        pendingSamples.chunked(PdbProtocol.MAX_INPUT_SAMPLES).forEach { chunk ->
+                            codec.write(stream, codec.input(chunk, width, height, inputSequence.incrementAndGet()))
+                        }
+                    }.onFailure { notifyTransportFailure(it) }
                 }
-            }.onFailure { notifyTransportFailure(it) }
+            }
+        } catch (error: RejectedExecutionException) {
+            if (running.get()) notifyTransportFailure(error)
         }
     }
     fun sendControl(message: PdbProtocol.Control) {
-        synchronized(controlLock) {
-            val stream = control ?: return
-            runCatching { codec.write(stream, codec.control(message, controlSequence.incrementAndGet())) }
-                .onFailure { notifyTransportFailure(it) }
+        val stream = control ?: return
+        try {
+            controlExecutor.execute {
+                synchronized(controlLock) {
+                    if (control !== stream) return@synchronized
+                    runCatching { codec.write(stream, codec.control(message, controlSequence.incrementAndGet())) }
+                        .onFailure { notifyTransportFailure(it) }
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            if (running.get()) notifyTransportFailure(error)
         }
     }
     fun recordDroppedVideoFrame() { droppedVideoFrames.incrementAndGet() }
@@ -117,6 +135,7 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
     }
     private fun notifyTransportFailure(error: Throwable, hello: ClientCapabilities? = lastHello) {
         if (!running.get() || !failureNotified.compareAndSet(false, true)) return
+        Log.e("PadDrawBoard", "Transport failure; reconnecting", error)
         listener.onFailure(error)
         if (hello != null) scheduleReconnect(hello)
     }
@@ -126,5 +145,5 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
         listener.onState("Reconnecting", false); sockets.forEach { runCatching { it.close() } }; sockets.clear(); input = null; control = null
         reconnect?.cancel(false); reconnect = executor.schedule({ reconnecting.set(false); if (running.get()) connect(hello) }, 1, TimeUnit.SECONDS)
     }
-    override fun close() { running.set(false); telemetry?.cancel(true); reconnect?.cancel(true); input = null; control = null; sockets.forEach { runCatching { it.close() } }; sockets.clear(); executor.shutdownNow() }
+    override fun close() { running.set(false); telemetry?.cancel(true); reconnect?.cancel(true); input = null; control = null; sockets.forEach { runCatching { it.close() } }; sockets.clear(); inputExecutor.shutdownNow(); controlExecutor.shutdownNow(); executor.shutdownNow() }
 }

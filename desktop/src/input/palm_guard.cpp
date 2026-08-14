@@ -3,18 +3,18 @@
 namespace pdb::input {
 PalmGuard::PalmGuard(std::chrono::milliseconds releaseDelay) : releaseDelay_(releaseDelay) {}
 
-void PalmGuard::ObservePen(bool inRange, std::chrono::steady_clock::time_point now) noexcept {
-  if (penInRange_ && !inRange) lastPenExit_ = now;
-  penInRange_ = inRange;
+void PalmGuard::ObservePen(bool tipDown, std::chrono::steady_clock::time_point now) noexcept {
+  if (penTipDown_ && !tipDown) lastPenExit_ = now;
+  penTipDown_ = tipDown;
   seenPen_ = true;
 }
 
 bool PalmGuard::AllowsTouch(std::chrono::steady_clock::time_point now) const noexcept {
-  return !penInRange_ && (!seenPen_ || now - lastPenExit_ >= releaseDelay_);
+  return !penTipDown_ && (!seenPen_ || now - lastPenExit_ >= releaseDelay_);
 }
 
 void PalmGuard::Reset() noexcept {
-  penInRange_ = false;
+  penTipDown_ = false;
   seenPen_ = false;
   lastPenExit_ = {};
 }

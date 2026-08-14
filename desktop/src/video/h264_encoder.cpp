@@ -309,6 +309,8 @@ void HardwareH264Encoder::ShutdownCurrentCandidate() noexcept {
   asynchronous_ = false;
   async_state_.StartStream();
   fatal_restart_requested_ = false;
+  consecutive_output_stream_changes_ = 0;
+  output_type_renegotiated_ = false;
   last_async_fatal_ = S_OK;
 }
 
@@ -333,6 +335,8 @@ void HardwareH264Encoder::Shutdown() {
   async_state_.StartStream();
   asynchronous_ = false;
   fatal_restart_requested_ = false;
+  consecutive_output_stream_changes_ = 0;
+  output_type_renegotiated_ = false;
   last_async_fatal_ = S_OK;
   if (mf_started_) {
     MFShutdown();
@@ -473,6 +477,80 @@ HRESULT HardwareH264Encoder::ConfigureCodecApi() {
   // product's latency contract requires low-latency mode.
   last_failure_stage_ = "codec_low_latency_legacy";
   return codec->SetValue(&CODECAPI_AVEncCommonLowLatency, &value);
+}
+
+HRESULT HardwareH264Encoder::RenegotiateOutputType() {
+  if (!transform_) return MF_E_NOT_INITIALIZED;
+
+  HRESULT last_error = MF_E_INVALIDMEDIATYPE;
+  for (DWORD index = 0;; ++index) {
+    ComPtr<IMFMediaType> candidate;
+    last_failure_stage_ = "stream_change_get_output_type";
+    HRESULT hr = transform_->GetOutputAvailableType(0, index, &candidate);
+    if (hr == MF_E_NO_MORE_TYPES) return last_error;
+    if (FAILED(hr)) return hr;
+    if (!candidate) {
+      last_error = E_UNEXPECTED;
+      continue;
+    }
+
+    GUID major_type{};
+    GUID subtype{};
+    if (FAILED(candidate->GetGUID(MF_MT_MAJOR_TYPE, &major_type)) ||
+        FAILED(candidate->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
+        major_type != MFMediaType_Video || subtype != MFVideoFormat_H264) {
+      continue;
+    }
+
+    UINT32 width = 0;
+    UINT32 height = 0;
+    hr = MFGetAttributeSize(candidate.Get(), MF_MT_FRAME_SIZE, &width, &height);
+    if (SUCCEEDED(hr) &&
+        (width != config_.size.width || height != config_.size.height)) {
+      continue;
+    }
+    if (FAILED(hr) && hr != MF_E_ATTRIBUTENOTFOUND) {
+      last_error = hr;
+      continue;
+    }
+
+    UINT32 frame_rate_numerator = 0;
+    UINT32 frame_rate_denominator = 0;
+    hr = MFGetAttributeRatio(candidate.Get(), MF_MT_FRAME_RATE,
+                             &frame_rate_numerator, &frame_rate_denominator);
+    if (SUCCEEDED(hr) &&
+        (frame_rate_numerator != config_.frame_rate || frame_rate_denominator != 1)) {
+      continue;
+    }
+    if (FAILED(hr) && hr != MF_E_ATTRIBUTENOTFOUND) {
+      last_error = hr;
+      continue;
+    }
+
+    // Preserve driver-supplied attributes such as MPEG sequence headers while
+    // restoring the constraints from the formally configured stream. Some
+    // Intel encoders advertise a sparse type after FORMAT_CHANGE and accept it
+    // in SetOutputType, but fail the following ProcessOutput unless these
+    // attributes are present.
+    if (FAILED(hr = MFSetAttributeSize(candidate.Get(), MF_MT_FRAME_SIZE,
+                                       config_.size.width, config_.size.height)) ||
+        FAILED(hr = MFSetAttributeRatio(candidate.Get(), MF_MT_FRAME_RATE,
+                                        config_.frame_rate, 1)) ||
+        FAILED(hr = candidate->SetUINT32(MF_MT_INTERLACE_MODE,
+                                         MFVideoInterlace_Progressive)) ||
+        FAILED(hr = candidate->SetUINT32(MF_MT_AVG_BITRATE,
+                                         config_.bitrate_bits_per_second)) ||
+        FAILED(hr = candidate->SetUINT32(MF_MT_MPEG2_PROFILE,
+                                         eAVEncH264VProfile_Main))) {
+      last_error = hr;
+      continue;
+    }
+
+    last_failure_stage_ = "stream_change_set_output_type";
+    hr = transform_->SetOutputType(0, candidate.Get(), 0);
+    if (SUCCEEDED(hr)) return S_OK;
+    last_error = hr;
+  }
 }
 
 HRESULT HardwareH264Encoder::BenchmarkCurrentCandidate(
@@ -662,55 +740,106 @@ HRESULT HardwareH264Encoder::Encode(ID3D11Texture2D* nv12_frame, std::uint64_t s
 }
 
 HRESULT HardwareH264Encoder::ProcessOutput(std::uint64_t sequence, EncodedAccessUnit* output) {
-  MFT_OUTPUT_STREAM_INFO stream_info{};
-  last_failure_stage_ = "get_output_stream_info";
-  HRESULT hr = transform_->GetOutputStreamInfo(0, &stream_info);
-  if (FAILED(hr)) return hr;
-  MFT_OUTPUT_DATA_BUFFER output_data{};
-  ComPtr<IMFSample> sample;
-  if ((stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-    ComPtr<IMFMediaBuffer> buffer;
-    hr = MFCreateMemoryBuffer(stream_info.cbSize, &buffer);
+  std::uint32_t completed_empty_output_retries = 0;
+  for (;;) {
+    MFT_OUTPUT_STREAM_INFO stream_info{};
+    last_failure_stage_ = "get_output_stream_info";
+    HRESULT hr = transform_->GetOutputStreamInfo(0, &stream_info);
     if (FAILED(hr)) return hr;
-    hr = MFCreateSample(&sample);
+    MFT_OUTPUT_DATA_BUFFER output_data{};
+    ComPtr<IMFSample> caller_sample;
+    if ((stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
+      ComPtr<IMFMediaBuffer> buffer;
+      hr = MFCreateMemoryBuffer(stream_info.cbSize, &buffer);
+      if (FAILED(hr)) return hr;
+      hr = MFCreateSample(&caller_sample);
+      if (FAILED(hr)) return hr;
+      hr = caller_sample->AddBuffer(buffer.Get());
+      if (FAILED(hr)) return hr;
+      output_data.pSample = caller_sample.Get();
+    }
+    DWORD status{};
+    if (consecutive_output_stream_changes_ == 0) {
+      last_failure_stage_ = "process_output";
+    } else if (output_type_renegotiated_) {
+      last_failure_stage_ = "process_output_after_stream_change_renegotiate";
+    } else {
+      last_failure_stage_ = "process_output_after_stream_change_retry";
+    }
+    hr = transform_->ProcessOutput(0, 1, &output_data, &status);
+
+    ComPtr<IMFCollection> events;
+    if (output_data.pEvents != nullptr) events.Attach(output_data.pEvents);
+    ComPtr<IMFSample> transform_sample;
+    if (!caller_sample && output_data.pSample != nullptr) {
+      // An MFT-provided sample transfers one reference even when ProcessOutput
+      // reports a format change or another failure.
+      transform_sample.Attach(output_data.pSample);
+    }
+
+    switch (ClassifyH264EncoderOutputStatus(
+        hr, output_data.dwStatus, consecutive_output_stream_changes_)) {
+      case H264EncoderOutputAction::kNeedMoreInput:
+        consecutive_output_stream_changes_ = 0;
+        output_type_renegotiated_ = false;
+        return S_FALSE;
+      case H264EncoderOutputAction::kRetryOutput:
+        output_type_renegotiated_ = false;
+        ++consecutive_output_stream_changes_;
+        // An asynchronous MFT permits exactly one ProcessOutput call per
+        // METransformHaveOutput event. Consume this event and wait for the MFT
+        // to announce output again instead of immediately calling it twice.
+        if (asynchronous_) return S_FALSE;
+        continue;
+      case H264EncoderOutputAction::kRenegotiateOutput:
+        hr = RenegotiateOutputType();
+        if (FAILED(hr)) return hr;
+        output_type_renegotiated_ = true;
+        ++consecutive_output_stream_changes_;
+        if (asynchronous_) return S_FALSE;
+        continue;
+      case H264EncoderOutputAction::kFail:
+        return hr;
+      case H264EncoderOutputAction::kConsumeOutput:
+        consecutive_output_stream_changes_ = 0;
+        output_type_renegotiated_ = false;
+        break;
+    }
+
+    ComPtr<IMFSample> produced = caller_sample ? caller_sample : transform_sample;
+    if (!produced && asynchronous_) {
+      // S_OK with only in-band events and no sample is valid. As above, wait
+      // for another HaveOutput event before making the next output call.
+      return S_FALSE;
+    }
+    if (ShouldRetryEmptyH264EncoderOutput(
+            produced != nullptr, completed_empty_output_retries)) {
+      ++completed_empty_output_retries;
+      continue;
+    }
+    if (!produced) {
+      last_failure_stage_ = "process_output_missing_sample";
+      return E_UNEXPECTED;
+    }
+    ComPtr<IMFMediaBuffer> contiguous;
+    hr = produced->ConvertToContiguousBuffer(&contiguous);
     if (FAILED(hr)) return hr;
-    hr = sample->AddBuffer(buffer.Get());
+    BYTE* bytes = nullptr;
+    DWORD max_length{};
+    DWORD length{};
+    hr = contiguous->Lock(&bytes, &max_length, &length);
     if (FAILED(hr)) return hr;
-    output_data.pSample = sample.Get();
+    output->bytes.assign(bytes, bytes + length);
+    contiguous->Unlock();
+    UINT32 clean_point{};
+    const bool clean_point_idr =
+        SUCCEEDED(produced->GetUINT32(MFSampleExtension_CleanPoint, &clean_point)) &&
+        clean_point != 0;
+    output->is_idr = clean_point_idr || AnnexBAccessUnitContainsIdr(output->bytes);
+    output->sequence = sequence;
+    output->encoded_at = std::chrono::steady_clock::now();
+    return S_OK;
   }
-  DWORD status{};
-  last_failure_stage_ = "process_output";
-  hr = transform_->ProcessOutput(0, 1, &output_data, &status);
-  ComPtr<IMFCollection> events;
-  if (output_data.pEvents != nullptr) events.Attach(output_data.pEvents);
-  if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_FALSE;
-  if (FAILED(hr)) return hr;
-  ComPtr<IMFSample> produced;
-  if (sample) {
-    produced = sample;
-  } else if (output_data.pSample != nullptr) {
-    // An MFT-provided sample has a transferred reference that we must release.
-    produced.Attach(output_data.pSample);
-  }
-  if (!produced) return E_UNEXPECTED;
-  ComPtr<IMFMediaBuffer> contiguous;
-  hr = produced->ConvertToContiguousBuffer(&contiguous);
-  if (FAILED(hr)) return hr;
-  BYTE* bytes = nullptr;
-  DWORD max_length{};
-  DWORD length{};
-  hr = contiguous->Lock(&bytes, &max_length, &length);
-  if (FAILED(hr)) return hr;
-  output->bytes.assign(bytes, bytes + length);
-  contiguous->Unlock();
-  UINT32 clean_point{};
-  const bool clean_point_idr =
-      SUCCEEDED(produced->GetUINT32(MFSampleExtension_CleanPoint, &clean_point)) &&
-      clean_point != 0;
-  output->is_idr = clean_point_idr || AnnexBAccessUnitContainsIdr(output->bytes);
-  output->sequence = sequence;
-  output->encoded_at = std::chrono::steady_clock::now();
-  return S_OK;
 }
 
 bool HardwareH264Encoder::TakeFatalRestartRequest() noexcept {

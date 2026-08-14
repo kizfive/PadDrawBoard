@@ -1,4 +1,71 @@
-# PadDrawBoard v0.1 交接文档
+# PadDrawBoard 当前交接（2026-08-14）
+
+> 本节是当前事实来源。下方“历史交接”保留早期基线记录，其中部分状态已被本轮实机修复取代。
+
+## 当前结论
+
+- Windows 与 Android 客户端已经在一台 Xiaomi Pad 7 类设备上完成实机联调。
+- 控制、视频和输入三个 ADB reverse 通道均已建立并保持 `Established`；端口仍为 48100、48101、48102。
+- 笔输入、手指拖动/点击、屏幕旋转后的坐标映射、视频显示和熄屏恢复均完成针对性修复。
+- Windows 托盘界面已精简并中文化；Windows 与 Android 均已接入新的 PadDrawBoard 应用图标。
+- 本轮最后验证：Windows CTest 7/7 通过，Android `testDebugUnitTest` 与 `assembleDebug` 通过，Debug APK 已覆盖安装并成功启动。
+
+架构、构建前置条件和完整验收方法不在此重复，分别参见：
+
+- `docs/architecture.md`
+- `README.md`
+- `docs/testing.md`
+
+## 本轮实现范围
+
+### 输入与触控
+
+- Android 端按一次手势的首个落点决定是否由绘图区捕获，后续 MOVE/UP 不会因为滑入状态栏而丢失。
+- MotionEvent 历史样本按 MOVE 发送，多指 POINTER_DOWN/POINTER_UP 会给每个 pointer 生成正确动作。
+- Android 发送输入和控制消息改为各自的单线程执行器，避免在 UI 线程同步写 socket 导致触摸或笔事件触发崩溃。
+- Windows 按时间戳和 pointer ID 分组注入历史触控样本，避免同一批次出现重复 pointer ID。
+- Android View 已经提供旋转后的坐标，Windows 端不再重复旋转；横竖屏位置映射由此恢复正常。
+- 防误触只在笔尖实际按下/移动时抑制手指。笔抬起后，手指仍可用于 Windows 触摸拖动和点击，但不会冒充笔迹。
+
+### 会话与视频
+
+- 新增客户端认证握手看门狗：ADB 启动成功但认证 socket 在超时内未建立时，会刷新一次性 token 并重新拉起 Android Activity，修复熄屏恢复后的 `invalid or missing session authentication token`。
+- Media Foundation H.264 输出处理现在覆盖 FORMAT_CHANGE、输出类型重新协商、异步 MFT 事件和空输出重试，降低编码器重启及黑屏概率。
+- 相关决策逻辑均补充原生单元测试；不要在没有硬件复测的情况下删去 stream-change 分支。
+
+### Windows 界面与品牌资源
+
+- 托盘状态、连接信息、显示器、码率、防误触和诊断工具已中文化；仅保留当前确实有功能实现的选项。
+- Logo 源文件位于 `assets/branding/`。
+- `tools/generate_app_icons.py` 可从透明 Logo 重新生成 Windows ICO、Android 普通/圆形/自适应图标。
+- Windows 资源脚本会把图标嵌入 EXE，托盘和窗口类也加载同一资源；Android Manifest 使用 `@mipmap/ic_launcher`。
+
+## 当前本机构建与实机产物
+
+- Windows 构建输出：`build/desktop/Release/PadDrawBoard.exe`
+- Android Debug APK：`android/app/build/outputs/apk/debug/app-debug.apk`
+- 当前便携测试目录：`artifacts/device-test-runtime-final/PadDrawBoard-0.1.0-windows-x64/`
+- `build/` 与 `artifacts/` 是本地生成目录，不应加入 Git。
+
+最近一次部署后，Windows 和 Android 进程均正常运行，三个通道均为已连接状态。设备序列号和任何本机账户信息不要写入仓库或日志样例。
+
+## 建议后续验证
+
+1. 在 Blender 中分别验证笔压、连续笔划、单指点击/拖动和多指手势，确认应用级行为与 Windows 原生触摸注入一致。
+2. 完成 `docs/testing.md` 中的一小时稳定性测试；当前只完成了短时实机回归。
+3. 在另一台不同 DPI/方向的 Android 平板上复测坐标、状态栏手势边界和自适应图标裁切。
+4. 继续核实 Xiaomi Focus Pen 的按键与悬停硬件事件；未观测到的能力不得标记为支持。
+5. 推送后观察 GitHub Actions；若 Windows 编码器测试在其他驱动环境失败，优先保留并分析失败 stage 与 HRESULT。
+
+## 建议技能
+
+- `github:github`：查看仓库、PR 和 issue 状态。
+- `github:gh-fix-ci`：处理推送后的 GitHub Actions 失败。
+- `computer-use:computer-use`：需要复核 Windows 托盘或其他原生 UI 时使用。
+- `agent-reach`：需要查询设备、驱动或平台官方资料时使用；只用于读取互联网内容。
+- `handoff`：下一次会话结束前再次压缩更新本交接。
+
+## 历史交接（早期 v0.1 基线）
 
 ## 1. 目标
 

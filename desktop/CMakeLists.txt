@@ -63,7 +63,11 @@ target_include_directories(pdb_app PUBLIC "${PDB_DESKTOP_INCLUDE_DIR}" "${PDB_PR
 target_link_libraries(pdb_app PUBLIC paddraw_protocol pdb_input pdb_video pdb_adb shell32)
 pdb_target_defaults(pdb_app)
 
-add_executable(PadDrawBoard WIN32 src/app/tray_main.cpp)
+add_executable(PadDrawBoard WIN32
+  src/app/tray_main.cpp
+  resources/paddrawboard.rc
+)
+target_include_directories(PadDrawBoard PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources")
 target_link_libraries(PadDrawBoard PRIVATE pdb_app)
 pdb_target_defaults(PadDrawBoard)
 set_target_properties(PadDrawBoard PROPERTIES OUTPUT_NAME "PadDrawBoard")

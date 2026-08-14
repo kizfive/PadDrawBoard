@@ -17,6 +17,7 @@ import io.paddrawboard.protocol.PdbProtocol
 
 class MainActivity : Activity() {
     private val state = AppState()
+    private val inputGestureRouter = InputGestureRouter()
     private lateinit var capture: InputCaptureView
     private lateinit var status: TextView
     private var session: AdbSession? = null
@@ -29,9 +30,22 @@ class MainActivity : Activity() {
             { session?.sendInput(it, capture.width, capture.height) },
             { state.snapshot().palmRejectionEnabled },
             { bits -> session?.sendControl(PdbProtocol.CapabilityChanged(bits)) },
-        ); root.addView(capture)
-        status = TextView(this).apply { setBackgroundColor(0x99000000.toInt()); setTextColor(-1); setPadding(20, 20, 20, 20) }; root.addView(status); setContentView(root); requestImmersive()
-        state.observe { runOnUiThread { status.text = "${it.connection}: ${it.status}\\n${it.capabilitySummary}" } }
+        ); root.addView(capture, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        ))
+        status = TextView(this).apply { setBackgroundColor(0x99000000.toInt()); setTextColor(-1); setPadding(20, 20, 20, 20) }
+        root.addView(status, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            android.view.Gravity.TOP,
+        )); setContentView(root); requestImmersive()
+        state.observe { snapshot -> runOnUiThread {
+            status.text = buildString {
+                append("${snapshot.connection}: ${snapshot.status}\n${snapshot.capabilitySummary}")
+                snapshot.lastError?.takeIf { it.isNotBlank() }?.let { append("\nError: $it") }
+            }
+        } }
         sessionToken = SessionAuth.parseTokenHex(intent.getStringExtra(SessionAuth.INTENT_EXTRA))
         if (sessionToken == null) {
             state.update { it.copy(connection = ConnectionState.ERROR, status = "Invalid or missing session authentication token") }
@@ -66,7 +80,7 @@ class MainActivity : Activity() {
                 if (surfaceReady) configureDecoder(config)
             } }
             override fun onVideo(frame: PdbProtocol.Frame) { if (frame.payload is PdbProtocol.VideoFrame) { val video = frame.payload as PdbProtocol.VideoFrame; session?.recordVideoFrame(video.presentationTimestampNs); decoder?.queue(video.accessUnit, video.presentationTimestampNs / 1_000, frame.header.flags and PdbProtocol.VIDEO_FLAG_IDR != 0L) } }
-            override fun onState(status: String, connected: Boolean) { state.update { it.copy(connection = if (connected) ConnectionState.CONNECTED else ConnectionState.RECONNECTING, status = status) } }
+            override fun onState(status: String, connected: Boolean) { state.update { it.copy(connection = if (connected) ConnectionState.CONNECTED else ConnectionState.RECONNECTING, status = status, lastError = if (connected) null else it.lastError) } }
             override fun onFailure(error: Throwable) {
                 cancelActivePointers()
                 state.update { it.copy(connection = ConnectionState.ERROR, status = "Session error", lastError = error.message) }
@@ -109,6 +123,36 @@ class MainActivity : Activity() {
             controller.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        if (::capture.isInitialized && ::status.isInitialized &&
+            inputGestureRouter.shouldCapture(event.actionMasked, event.y, status.bottom)) {
+            return capture.captureMotionEvent(event)
+        }
+        return super.dispatchTouchEvent(event)
+    }
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        if (::capture.isInitialized && ::status.isInitialized && event.y >= status.bottom &&
+            capture.captureMotionEvent(event)) {
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
     override fun onWindowFocusChanged(hasFocus: Boolean) { super.onWindowFocusChanged(hasFocus); if (hasFocus) requestImmersive() }
     override fun onDestroy() { stop(); super.onDestroy() }
+}
+
+internal class InputGestureRouter {
+    private var capturing = false
+
+    fun shouldCapture(actionMasked: Int, y: Float, statusBottom: Int): Boolean {
+        if (actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+            capturing = y >= statusBottom
+        }
+        val result = capturing
+        if (actionMasked == android.view.MotionEvent.ACTION_UP ||
+            actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
+            capturing = false
+        }
+        return result
+    }
 }

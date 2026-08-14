@@ -1,4 +1,5 @@
 #include "pdb/app/config.h"
+#include "pdb/app/client_handshake_watchdog.h"
 #include "pdb/app/desktop_server.h"
 #include "pdb/app/telemetry.h"
 #include "pdb/app/tray_commands.h"
@@ -14,6 +15,19 @@
 #include <span>
 
 namespace {
+
+void TestClientHandshakeWatchdog() {
+  using namespace std::chrono_literals;
+  pdb::app::ClientHandshakeWatchdog watchdog{5s};
+  const auto start = std::chrono::steady_clock::time_point{};
+  assert(!watchdog.Observe(false, false, start));
+  assert(!watchdog.Observe(true, false, start));
+  assert(!watchdog.Observe(true, false, start + 4999ms));
+  assert(watchdog.Observe(true, false, start + 5s));
+  assert(!watchdog.Observe(true, true, start + 6s));
+  assert(!watchdog.Observe(true, false, start + 7s));
+  assert(!watchdog.Observe(false, false, start + 20s));
+}
 
 std::filesystem::path TestDirectory() {
   return std::filesystem::temp_directory_path() /
@@ -119,6 +133,14 @@ void TestDynamicClientCapabilityReadiness() {
 void TestTrayCommandLogic() {
   assert(pdb::app::DecodeTrayCommand(pdb::app::kTrayExitCommand).kind ==
          pdb::app::TrayCommandKind::kExit);
+  assert(pdb::app::DecodeTrayCommand(pdb::app::kTrayOpenConfigCommand).kind ==
+         pdb::app::TrayCommandKind::kOpenConfigFolder);
+  assert(pdb::app::DecodeTrayCommand(pdb::app::kTrayOpenTelemetryCommand).kind ==
+         pdb::app::TrayCommandKind::kOpenTelemetry);
+  assert(pdb::app::DecodeTrayCommand(pdb::app::kTrayExportTelemetryCommand).kind ==
+         pdb::app::TrayCommandKind::kExportTelemetry);
+  assert(pdb::app::DecodeTrayCommand(pdb::app::kTrayTogglePalmCommand).kind ==
+         pdb::app::TrayCommandKind::kTogglePalmGuard);
   assert(pdb::app::DecodeTrayCommand(pdb::app::TrayBitrateCommand(80)).value == 80);
   assert(pdb::app::IsTrayBitratePreset(20));
   assert(pdb::app::IsTrayBitratePreset(120));
@@ -126,6 +148,8 @@ void TestTrayCommandLogic() {
   const auto monitor = pdb::app::DecodeTrayCommand(pdb::app::TrayMonitorCommand(7));
   assert(monitor.kind == pdb::app::TrayCommandKind::kMonitor && monitor.value == 7);
   assert(pdb::app::DecodeTrayCommand(999).kind == pdb::app::TrayCommandKind::kNone);
+  assert(pdb::app::ServerPhaseText(pdb::app::ServerPhase::kActive) == L"运行正常");
+  assert(pdb::app::ServerPhaseText(pdb::app::ServerPhase::kDegraded) == L"部分功能不可用");
 }
 
 void TestSessionAuthPreface() {
@@ -156,6 +180,7 @@ void TestSessionAuthPreface() {
 }  // namespace
 
 int main() {
+  TestClientHandshakeWatchdog();
   TestRoundTripAndAtomicReplacement();
   TestInvalidSchemaFallsBackSafely();
   TestTelemetrySchemaAndReadiness();

@@ -5,6 +5,7 @@
 
 #include <mftransform.h>
 #include <mfidl.h>
+#include <mferror.h>
 
 #include <chrono>
 #include <span>
@@ -36,6 +37,47 @@ struct H264EncoderCandidateDiagnostics {
 [[nodiscard]] constexpr bool IsOptionalH264CodecApiPropertyFailure(HRESULT hr) noexcept {
   return hr == E_INVALIDARG || hr == E_NOTIMPL || hr == E_NOINTERFACE ||
          hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+}
+
+inline constexpr std::uint32_t kMaxH264EncoderOutputStreamChanges = 4;
+inline constexpr std::uint32_t kMaxH264EncoderEmptyOutputRetries = 4;
+
+enum class H264EncoderOutputAction : std::uint8_t {
+  kConsumeOutput,
+  kNeedMoreInput,
+  kRetryOutput,
+  kRenegotiateOutput,
+  kFail,
+};
+
+// ProcessOutput can report a format change after the first encoded sample,
+// especially on Intel hardware MFTs. The pending output remains inside the
+// transform and must be requested again after selecting an advertised output
+// type. Bound the retries so a broken driver cannot spin forever.
+[[nodiscard]] constexpr H264EncoderOutputAction ClassifyH264EncoderOutputStatus(
+    HRESULT hr, DWORD output_buffer_status,
+    std::uint32_t completed_stream_changes) noexcept {
+  if (SUCCEEDED(hr)) return H264EncoderOutputAction::kConsumeOutput;
+  if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+    return H264EncoderOutputAction::kNeedMoreInput;
+  }
+  if (hr == MF_E_TRANSFORM_STREAM_CHANGE &&
+      completed_stream_changes < kMaxH264EncoderOutputStreamChanges) {
+    constexpr DWORD kStreamStatusMask =
+        MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE | MFT_OUTPUT_DATA_BUFFER_STREAM_END;
+    const DWORD stream_status = output_buffer_status & kStreamStatusMask;
+    if (stream_status == MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
+      return H264EncoderOutputAction::kRenegotiateOutput;
+    }
+    return H264EncoderOutputAction::kRetryOutput;
+  }
+  return H264EncoderOutputAction::kFail;
+}
+
+[[nodiscard]] constexpr bool ShouldRetryEmptyH264EncoderOutput(
+    bool has_sample, std::uint32_t completed_empty_output_retries) noexcept {
+  return !has_sample &&
+         completed_empty_output_retries < kMaxH264EncoderEmptyOutputRetries;
 }
 
 // Benchmarking may leave a selected MFT with stream types that are no longer
@@ -130,6 +172,7 @@ class HardwareH264Encoder final {
  private:
   [[nodiscard]] HRESULT ConfigureTransform(const H264EncoderConfig& config);
   [[nodiscard]] HRESULT ReconfigureSelectedTransformForStream();
+  [[nodiscard]] HRESULT RenegotiateOutputType();
   [[nodiscard]] HRESULT ConfigureCodecApi();
   [[nodiscard]] HRESULT ProcessOutput(std::uint64_t sequence, EncodedAccessUnit* output);
   [[nodiscard]] HRESULT PumpAsyncEvents();
@@ -152,6 +195,8 @@ class HardwareH264Encoder final {
   AsyncMftStateMachine async_state_;
   bool asynchronous_{};
   bool fatal_restart_requested_{};
+  std::uint32_t consecutive_output_stream_changes_{};
+  bool output_type_renegotiated_{};
   HRESULT last_async_fatal_{S_OK};
   bool mf_started_{};
   std::vector<H264EncoderCandidateDiagnostics> candidate_diagnostics_;
