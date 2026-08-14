@@ -9,6 +9,7 @@
 - 笔输入、手指拖动/点击、屏幕旋转后的坐标映射、视频显示和熄屏恢复均完成针对性修复。
 - Windows 托盘界面已精简并中文化；Windows 与 Android 均已接入新的 PadDrawBoard 应用图标。
 - 本轮最后验证：Windows CTest 7/7 通过，Android `testDebugUnitTest` 与 `assembleDebug` 通过，Debug APK 已覆盖安装并成功启动。
+- 接手会话复验（同日）：Windows（MinGW）构建通过、CTest 7/7；Android `testDebugUnitTest` 与 `assembleDebug` 通过。
 
 架构、构建前置条件和完整验收方法不在此重复，分别参见：
 
@@ -40,12 +41,11 @@
 - `tools/generate_app_icons.py` 可从透明 Logo 重新生成 Windows ICO、Android 普通/圆形/自适应图标。
 - Windows 资源脚本会把图标嵌入 EXE，托盘和窗口类也加载同一资源；Android Manifest 使用 `@mipmap/ic_launcher`。
 
-## 当前本机构建与实机产物
+## 当前构建产物与实机状态
 
-- Windows 构建输出：`build/desktop/Release/PadDrawBoard.exe`
-- Android Debug APK：`android/app/build/outputs/apk/debug/app-debug.apk`
-- 当前便携测试目录：`artifacts/device-test-runtime-final/PadDrawBoard-0.1.0-windows-x64/`
-- `build/` 与 `artifacts/` 是本地生成目录，不应加入 Git。
+- Windows 构建输出：桌面端目标 `PadDrawBoard.exe`，位于本地构建目录（`out\*` 或 `build\`，随各机惯例而定）。
+- Android Debug APK：`android/app/build/outputs/apk/debug/app-debug.apk`（标准 Gradle 输出路径，各机一致；2026-08-14 已重新构建验证）。
+- `build/`、`out/` 与 `artifacts/` 是本地生成目录，不应加入 Git；打包与便携测试产物均位于 `artifacts/` 下。
 
 最近一次部署后，Windows 和 Android 进程均正常运行，三个通道均为已连接状态。设备序列号和任何本机账户信息不要写入仓库或日志样例。
 
@@ -56,6 +56,8 @@
 3. 在另一台不同 DPI/方向的 Android 平板上复测坐标、状态栏手势边界和自适应图标裁切。
 4. 继续核实 Xiaomi Focus Pen 的按键与悬停硬件事件；未观测到的能力不得标记为支持。
 5. 推送后观察 GitHub Actions；若 Windows 编码器测试在其他驱动环境失败，优先保留并分析失败 stage 与 HRESULT。
+6. 若本地 SDK/工具链位置发生过迁移，用新位置完整跑一次 Windows 打包脚本，确认 cmake 与 platform-tools 引用正常。
+7. 重启 adb 并复测三通道，确认控制、视频、输入通道恢复正常。
 
 ## 建议技能
 
