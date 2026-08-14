@@ -1,4 +1,4 @@
-# PadDrawBoard 当前交接（2026-08-14）
+# PadDrawBoard 当前交接（2026-08-15）
 
 > 本节是当前事实来源。下方“历史交接”保留早期基线记录，其中部分状态已被本轮实机修复取代。
 
@@ -9,7 +9,9 @@
 - 笔输入、手指拖动/点击、屏幕旋转后的坐标映射、视频显示和熄屏恢复均完成针对性修复。
 - Windows 托盘界面已精简并中文化；Windows 与 Android 均已接入新的 PadDrawBoard 应用图标。
 - 本轮最后验证：Windows CTest 7/7 通过，Android `testDebugUnitTest` 与 `assembleDebug` 通过，Debug APK 已覆盖安装并成功启动。
-- 接手会话复验（同日）：Windows（MinGW）构建通过、CTest 7/7；Android `testDebugUnitTest` 与 `assembleDebug` 通过。
+- 接手会话复验（2026-08-15 凌晨）：Windows（MinGW）构建通过、CTest 7/7；Android `testDebugUnitTest` 与 `assembleDebug` 通过。
+- 接手会话还发现一个**未解决**的严重问题：在一台 AMD 核显 + NVIDIA 独显混合显卡的机器上，视频画面在会话建立后约 15-25 秒永久冻结（触控与控制通道不受影响、无会话断开）；同一份最新代码在纯 Intel 核显机器上实时刷新正常。完整排查记录见下文专节。
+- 本机测试时曾同时运行 MuMu 模拟器远程服务、Wallpaper Engine 与 NVIDIA App 浮窗等屏幕相关组件，已全部停用，但冻结未解除。
 
 架构、构建前置条件和完整验收方法不在此重复，分别参见：
 
@@ -49,6 +51,42 @@
 
 最近一次部署后，Windows 和 Android 进程均正常运行，三个通道均为已连接状态。设备序列号和任何本机账户信息不要写入仓库或日志样例。
 
+**注意**：工作区中当前有 6 个文件未提交的排查/修复改动（见下方排查记录），下次会话先确认其状态再构建。
+
+## 视频冻结排查记录（2026-08-15，未解决）
+
+> 本机指 AMD 核显 + NVIDIA 独显混合显卡的 Windows 机器；参考机为纯 Intel 核显机器（最新代码在该机上实时刷新与触控均正常）。
+
+### 现象
+
+- 会话建立成功、三通道 `Established`、触控与笔输入正常、客户端能解码并显示启动阶段的首批帧。
+- 会话建立后约 15-25 秒，视频画面永久冻结：桌面端不再采集、不再编码，客户端 `video_latency_us` 归零；控制/输入通道与客户端遥测完全不受影响。
+- 多次运行（Debug 与 Release、MinGW）均可复现；分支提交之前的旧构建同样复现，因此**不是本分支引入的回归**。
+
+### 已确认的事实
+
+- 桌面端视频循环冻结时进程 CPU 接近 0（阻塞等待，不是忙循环）；控制线程仍在每秒写遥测。
+- 循环心跳探针（`video_loop_probe` 遥测）显示视频循环在启动后第 50~190 次迭代之间停摆，冻结点漂移（竞态特征）。
+- 编码器阶段日志（`%APPDATA%\PadDrawBoard\encoder_stages.log`）显示最后一条记录停在异步编码路径的 `Poll end` 之后、下一轮循环之前。
+- 编码器为异步的 NVIDIA H.264 Encoder MFT（NVENC）；`nvidia-smi` 确认 PadDrawBoard 进程运行在独立显卡上。
+- 已排除：MuMu 远程服务（已停用并禁用）、Wallpaper Engine（已退出）、NVIDIA App 浮窗（已退出）、旧版代码回归、同步 MFT 重协商死锁假设。
+- 连带问题：本机 adb 服务器曾多次整体挂死（`adb shell` 与 `kill-server` 均超时），强杀进程并重启服务器可恢复；与视频冻结是否同源未确认。
+
+### 工作区中未提交的代码改动（6 个文件，均为排查遗留）
+
+- `desktop/src/app/desktop_server.cpp`：`EndSession` 在会话未激活时也写 `pre-active:` 遥测（建议保留）；`video_loop_probe` 心跳遥测（临时，可删）。
+- `desktop/src/video/h264_encoder.cpp`：同步路径 stream-change 后不再立即重入阻塞式 `ProcessOutput`（防御性修复，建议保留）；异步路径 stream-change 改为整体重建编码器实例、新增 `PerformFormalStreamReset`（针对 NVENC 中途 `SetOutputType` 挂死的修复，**未能解除冻结**）；临时 `EncoderStageLog` 阶段日志（删除前先保留可复现）。
+- `desktop/include/pdb/video/telemetry.h`、`desktop/include/pdb/app/desktop_server.h`、`desktop/src/video/video_pipeline.cpp`：`OnEncoderSelected` 遥测接口（保留有助于诊断，可斟酌）。
+- 另存在分支提交前的对照构建工作树（用于差分测试），可复现生成，无需保留。
+
+### 下一步排查建议（按优先级）
+
+1. 对冻结中的进程做线程栈转储（procdump/WinDbg），确认阻塞调用点；现有证据已把它缩小到异步编码调用尾部到下一轮循环之间。
+2. 停用 SuperDisplay 服务后复测（本机另一屏幕捕获类组件，尚未排除）。
+3. 对照实验：在 NVIDIA 控制面板把 PadDrawBoard 强制到核显运行，验证"独显 NVENC + 桌面复制"是否就是冲突源；若核显可用，可考虑软件编码回退方案。
+4. 单独排查 adb 服务器挂死（本机同时存在多个 adb 版本，建议统一使用 36.0.2）。
+5. 结案后清理全部临时诊断代码并补原生测试，再考虑推送分支。
+
 ## 建议后续验证
 
 1. 在 Blender 中分别验证笔压、连续笔划、单指点击/拖动和多指手势，确认应用级行为与 Windows 原生触摸注入一致。
@@ -58,6 +96,9 @@
 5. 推送后观察 GitHub Actions；若 Windows 编码器测试在其他驱动环境失败，优先保留并分析失败 stage 与 HRESULT。
 6. 若本地 SDK/工具链位置发生过迁移，用新位置完整跑一次 Windows 打包脚本，确认 cmake 与 platform-tools 引用正常。
 7. 重启 adb 并复测三通道，确认控制、视频、输入通道恢复正常。
+8. 按"视频冻结排查记录"继续定位混合显卡机器的视频冻结；修复前不要在该机器上宣称视频可用。
+9. 混合显卡机器结案后，在纯 Intel 核显参考机上复跑一轮验证，确认修复没有破坏原有环境。
+10. 处理工作区中未提交的排查改动：保留防御性修复、删除临时日志，补测试后提交。
 
 ## 建议技能
 
