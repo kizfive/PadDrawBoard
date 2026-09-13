@@ -40,13 +40,23 @@ class LatencyToolTests(unittest.TestCase):
 
     def test_timestamp_derived_latency(self):
         records = [{
-            "kind": "video_sample",
+            "kind": "glass_sample",
             "capture_timestamp_ns": 100,
             "presentation_timestamp_ns": 20_100_000,
         }, {"kind": "input_transport", "latency_us": 7500}]
         report = latency_tool.analyze_latency(records, 35, 50, 70, 8)
         self.assertEqual(report["glass_to_glass"]["median"], 20.0999)
         self.assertEqual(report["input_transport"]["median"], 7.5)
+
+    def test_encoder_samples_cannot_pass_glass_release_gate(self):
+        records = [{"kind": "video_sample", "capture_timestamp_ns": 100,
+                    "presentation_timestamp_ns": 20_100_000,
+                    "latency_ms": 20, "glass_to_glass_ms": 20},
+                   {"kind": "input_transport", "latency_us": 1000}]
+        report = latency_tool.analyze_latency(records, 35, 50, 70, 8)
+        self.assertEqual(report["glass_to_glass"]["count"], 0)
+        self.assertIsNone(report["gates"]["release_median_le_50ms"])
+        self.assertFalse(report["releasePass"])
 
     def test_soak_passes_and_rejects_failure_conditions(self):
         good = [

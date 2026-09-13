@@ -1,8 +1,10 @@
 #include "pdb/app/desktop_server.h"
+#include "pdb/app/client_handshake_watchdog.h"
 
 #include "pdb/app/framed_stream.h"
 #include "pdb/app/session_auth.h"
 #include "pdb/adb/client.h"
+#include "pdb/video/frame_pacer.h"
 #include "pdb/adb/input_probe.h"
 #include "pdb/adb/process.h"
 #include "pdb/adb/session.h"
@@ -15,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <fstream>
 #include <optional>
 #include <random>
@@ -76,6 +79,7 @@ using paddrawboard::protocol::VideoFrame;
 constexpr int kControlHandshakeTimeoutMs = 5'000;
 constexpr int kChannelHandshakeTimeoutMs = 5'000;
 constexpr int kSocketReceiveTimeoutMs = 1'000;
+
 constexpr int kSocketSendTimeoutMs = 50;
 
 std::uint64_t SteadyNowNs() noexcept {
@@ -274,38 +278,91 @@ std::filesystem::path TelemetryWriter::DefaultPath() {
   return std::filesystem::current_path() / L"PadDrawBoard" / L"telemetry.jsonl";
 }
 
-void TelemetryWriter::RotateIfNeeded(std::uintmax_t incoming_bytes) {
-  std::error_code error;
-  const std::uintmax_t existing = std::filesystem::exists(path_, error)
-                                      ? std::filesystem::file_size(path_, error)
-                                      : 0;
-  if (error || existing == 0 || existing + incoming_bytes <= kMaximumBytes) return;
+bool TelemetryWriter::OpenForAppend() {
+  if (output_.is_open()) {
+    if (output_) return true;
+    CloseStream();
+    return false;
+  }
 
+  std::error_code error;
+  if (!path_.parent_path().empty()) {
+    std::filesystem::create_directories(path_.parent_path(), error);
+    if (error) return false;
+  }
+  std::uintmax_t existing = 0;
+  if (std::filesystem::exists(path_, error)) {
+    if (error) return false;
+    existing = std::filesystem::file_size(path_, error);
+    if (error) return false;
+  } else if (error) {
+    return false;
+  }
+  output_.open(path_, std::ios::binary | std::ios::app);
+  if (!output_) {
+    output_.clear();
+    current_bytes_ = 0;
+    return false;
+  }
+  current_bytes_ = existing;
+  return true;
+}
+
+void TelemetryWriter::CloseStream() const noexcept {
+  if (output_.is_open()) output_.close();
+  output_.clear();
+  current_bytes_ = 0;
+}
+
+bool TelemetryWriter::FlushStream() const noexcept {
+  if (!output_.is_open()) return true;
+  output_.flush();
+  if (output_) return true;
+  CloseStream();
+  return false;
+}
+
+bool TelemetryWriter::RotateIfNeeded(std::uintmax_t incoming_bytes) {
+  if (current_bytes_ == 0 ||
+      incoming_bytes <= kMaximumBytes -
+          (current_bytes_ < kMaximumBytes ? current_bytes_ : kMaximumBytes)) {
+    return true;
+  }
+
+  if (!FlushStream()) return false;
+  CloseStream();
+
+  std::error_code error;
   for (unsigned index = kRetainedRotations; index > 0; --index) {
     const std::filesystem::path source = index == 1
         ? path_ : std::filesystem::path(path_.wstring() + L"." + std::to_wstring(index - 1));
     const std::filesystem::path destination =
         std::filesystem::path(path_.wstring() + L"." + std::to_wstring(index));
     std::filesystem::remove(destination, error);
-    error.clear();
-    if (std::filesystem::exists(source, error)) {
-      error.clear();
-      std::filesystem::rename(source, destination, error);
+    if (error) return OpenForAppend();
+    if (!std::filesystem::exists(source, error)) {
+      if (error) return OpenForAppend();
+      continue;
     }
+    std::filesystem::rename(source, destination, error);
+    if (error) return OpenForAppend();
   }
+  return OpenForAppend();
 }
 
 void TelemetryWriter::Write(std::string_view line) {
   if (line.empty()) return;
   std::scoped_lock lock(mutex_);
-  std::error_code error;
-  std::filesystem::create_directories(path_.parent_path(), error);
-  if (error) return;
-  RotateIfNeeded(static_cast<std::uintmax_t>(line.size() + 1));
-  std::ofstream output(path_, std::ios::binary | std::ios::app);
-  if (!output) return;
-  output.write(line.data(), static_cast<std::streamsize>(line.size()));
-  output.put('\n');
+  const auto incoming_bytes = static_cast<std::uintmax_t>(line.size() + 1);
+  if (!OpenForAppend() || !RotateIfNeeded(incoming_bytes)) return;
+  output_.write(line.data(), static_cast<std::streamsize>(line.size()));
+  output_.put('\n');
+  output_.flush();
+  if (!output_) {
+    CloseStream();
+    return;
+  }
+  current_bytes_ += incoming_bytes;
 }
 
 std::uint64_t TelemetryWriter::BeginRun() {
@@ -334,6 +391,7 @@ std::uint64_t TelemetryWriter::BeginRun() {
 
 void TelemetryWriter::EndRun() noexcept {
   std::scoped_lock lock(mutex_);
+  (void)FlushStream();
   if (!run_marker_active_) return;
   std::error_code error;
   std::filesystem::remove(std::filesystem::path(path_.wstring() + L".running"), error);
@@ -344,6 +402,10 @@ bool TelemetryWriter::CopyTo(const std::filesystem::path& destination,
                              std::string* error) const {
   std::scoped_lock lock(mutex_);
   if (destination == path_) return true;
+  if (!FlushStream()) {
+    if (error != nullptr) *error = "cannot flush telemetry file";
+    return false;
+  }
   std::error_code filesystem_error;
   if (!std::filesystem::exists(path_, filesystem_error)) {
     if (error != nullptr) *error = "telemetry file does not exist";
@@ -497,6 +559,7 @@ void DesktopServer::AcceptLoop(std::stop_token stop_token) {
 }
 
 void DesktopServer::AdbLoop(std::stop_token stop_token) {
+  ClientHandshakeWatchdog handshake_watchdog;
   while (!stop_token.stop_requested() && running_.load()) {
     bool probe_attempted = false;
     adb::AdbLocatorOptions options;
@@ -527,6 +590,14 @@ void DesktopServer::AdbLoop(std::stop_token stop_token) {
     while (!stop_token.stop_requested() && running_.load()) {
       adb_session_->Tick();
       const bool connected = adb_session_->connected();
+      if (handshake_watchdog.Observe(
+              connected, session_active_.load(std::memory_order_acquire),
+              std::chrono::steady_clock::now())) {
+        adb_session_->NotifyChannelLoss(
+            "Android client authentication handshake timed out; relaunching with a fresh token");
+        probe_attempted = false;
+        continue;
+      }
       if (connected && !probe_attempted) {
         const adb::DeviceListing selected = client_pointer->SelectSingleAuthorizedDevice(stop_token);
         if (selected.status == adb::DeviceSelectionStatus::Authorized && selected.selected.has_value()) {
@@ -700,7 +771,10 @@ bool DesktopServer::EstablishSession(SOCKET control_socket) {
   mapper.monitor = MonitorRect(monitor);
   mapper.contentAspectRatio = static_cast<float>(chosen_video->first.width) /
                               static_cast<float>(chosen_video->first.height);
-  mapper.rotation = *rotation;
+  // MotionEvent coordinates are already expressed in the currently rotated
+  // Android View. The orientation value only starts a new input epoch; applying
+  // it here would rotate the normalized View coordinates a second time.
+  mapper.rotation = input::Rotation::k0;
   mapper.orientationEpoch = orientation_epoch_;
   if (!input_.Configure(mapper)) {
     std::scoped_lock lock(video_mutex_);
@@ -816,7 +890,9 @@ void DesktopServer::ControlLoop(std::stop_token stop_token, std::uint64_t genera
         mapper.contentAspectRatio = configured_video_size_.height == 0 ? 0.0F :
             static_cast<float>(configured_video_size_.width) /
                 static_cast<float>(configured_video_size_.height);
-        mapper.rotation = *rotation;
+        // The Android View has already transformed MotionEvent coordinates for
+        // the new display orientation. Keep host mapping in View coordinates.
+        mapper.rotation = input::Rotation::k0;
         mapper.orientationEpoch = orientation_epoch_;
         input_.OnOrientationChange(mapper);
         std::scoped_lock adapter_lock(input_adapter_mutex_);
@@ -921,6 +997,11 @@ void DesktopServer::VideoLoop(std::stop_token stop_token, std::uint64_t generati
   std::uint64_t pending_presentation_timestamp_ns{};
   bool backpressure_idr_notified = false;
   std::int64_t backpressure_started_ns = 0;
+  std::condition_variable_any pending_encode_pause;
+  std::mutex pending_encode_pause_mutex;
+  video::EncodedAccessUnit encoded;
+  std::chrono::steady_clock::time_point next_frame_at{};
+  video::FramePacer frame_pacer;
   while (!stop_token.stop_requested() && IsGenerationActive(generation)) {
     SOCKET socket = INVALID_SOCKET;
     {
@@ -976,16 +1057,33 @@ void DesktopServer::VideoLoop(std::stop_token stop_token, std::uint64_t generati
       return;
     }
 
-    video::EncodedAccessUnit encoded;
+    // The encoder's media type does not throttle Desktop Duplication. In
+    // particular fast encoders can otherwise run at the monitor's refresh
+    // rate, wasting resources and flooding the 60-fps Android decoder.
+    if (std::chrono::steady_clock::now() < next_frame_at) {
+      frame_pacer.WaitUntil(next_frame_at);
+      if (stop_token.stop_requested() || !IsGenerationActive(generation)) return;
+    }
     HRESULT capture = S_FALSE;
     HRESULT encode = S_FALSE;
+    bool capture_skipped_for_pending = false;
     std::string video_failure_stage;
     {
       std::scoped_lock lock(video_mutex_);
-      capture = video_.CaptureOnce(16);
-      if (capture == S_OK) encode = video_.EncodeLatest(&encoded);
+      // Poll the asynchronous encoder before touching Desktop Duplication.
+      // A pending MFT input must never overlap AcquireNextFrame: on hybrid
+      // GPU systems the two calls can deadlock in different driver queues.
+      encode = video_.EncodeLatest(&encoded);
+      const auto action = video::DecideVideoLoopAfterInitialEncode(encode);
+      if (action == video::VideoLoopAfterEncodeAction::kCapture) {
+        capture_skipped_for_pending = video_.has_pending_encode();
+        capture = video_.CaptureOnce(16);
+        if (video::ShouldEncodeAfterCapture(capture)) {
+          encode = video_.EncodeLatest(&encoded);
+        }
       if (FAILED(capture) || FAILED(encode)) {
         video_failure_stage = std::string(video_.last_failure_stage());
+      }
       }
     }
     if (FAILED(capture) || FAILED(encode)) {
@@ -993,7 +1091,19 @@ void DesktopServer::VideoLoop(std::stop_token stop_token, std::uint64_t generati
                  HResultText(FAILED(capture) ? capture : encode));
       return;
     }
+    if (video::ShouldYieldAfterPendingEncodeNoProgress(
+            encode, capture, capture_skipped_for_pending)) {
+      // The pending async input has not progressed, so CaptureOnce correctly
+      // skipped AcquireNextFrame. Yield briefly without delaying the normal
+      // 16ms Desktop Duplication timeout path. The stop token can interrupt
+      // this wait during session shutdown.
+      std::unique_lock pause_lock(pending_encode_pause_mutex);
+      pending_encode_pause.wait_for(
+          pause_lock, stop_token, std::chrono::milliseconds(1), [] { return false; });
+      continue;
+    }
     if (encode != S_OK || encoded.bytes.empty()) continue;
+    next_frame_at = encoded.acquired_at + std::chrono::nanoseconds(1'000'000'000 / 60);
     VideoFrame payload;
     payload.captureTimestampNs = SteadyTimeNs(encoded.acquired_at);
     payload.presentationTimestampNs = SteadyTimeNs(encoded.encoded_at);
@@ -1003,12 +1113,13 @@ void DesktopServer::VideoLoop(std::stop_token stop_token, std::uint64_t generati
     }
     const std::uint64_t capture_timestamp_ns = payload.captureTimestampNs;
     const std::uint64_t presentation_timestamp_ns = payload.presentationTimestampNs;
-    payload.accessUnit = std::move(encoded.bytes);
+    payload.accessUnit.swap(encoded.bytes);
     Frame frame;
     frame.header = FrameHeader{encoded.is_idr ? paddrawboard::protocol::kVideoFlagIdr : 0,
                                video_sequence_.fetch_add(1), MessageType::VideoFrame};
     frame.payload = std::move(payload);
     const FrameIoResult started = pending_frame.Start(frame);
+    std::get<VideoFrame>(frame.payload).accessUnit.swap(encoded.bytes);
     if (started.status != IoStatus::kOk) {
       EndSession(started.error.empty() ? "cannot serialize video frame" : started.error);
       return;
@@ -1021,7 +1132,10 @@ void DesktopServer::VideoLoop(std::stop_token stop_token, std::uint64_t generati
 
 void DesktopServer::EndSession(std::string reason) noexcept {
   ClearPendingClockSync();
-  if (!session_active_.exchange(false)) return;
+  if (!session_active_.exchange(false)) {
+    telemetry_.Write(TelemetryJson::SessionEnd("pre-active: " + reason));
+    return;
+  }
   telemetry_.Write(TelemetryJson::SessionEnd(reason));
   const std::string reconnect_reason = reason;
   generation_.fetch_add(1);
@@ -1202,16 +1316,28 @@ void DesktopServer::OnStreamResetRequested() {
       status_.stream_resets, std::nullopt));
 }
 
+void DesktopServer::OnEncoderSelected(const std::wstring& name, bool asynchronous) {
+  std::string escaped;
+  escaped.reserve(name.size());
+  for (const wchar_t character : name) {
+    if (character == L'"' || character == L'\\') escaped += '\\';
+    escaped += character < 0x80 ? static_cast<char>(character) : '?';
+  }
+  telemetry_.Write("{\"kind\":\"encoder_selected\",\"name\":\"" + escaped +
+                   "\",\"asynchronous\":" +
+                   std::string(asynchronous ? "true" : "false") + "}");
+}
+
 std::wstring ServerPhaseText(ServerPhase phase) {
   switch (phase) {
-    case ServerPhase::kStopped: return L"Stopped";
-    case ServerPhase::kStarting: return L"Starting";
-    case ServerPhase::kAwaitingAdb: return L"Waiting for ADB";
-    case ServerPhase::kAwaitingClient: return L"Waiting for tablet";
-    case ServerPhase::kActive: return L"Active";
-    case ServerPhase::kDegraded: return L"Degraded";
+    case ServerPhase::kStopped: return L"已停止";
+    case ServerPhase::kStarting: return L"正在启动";
+    case ServerPhase::kAwaitingAdb: return L"等待平板连接";
+    case ServerPhase::kAwaitingClient: return L"等待平板客户端";
+    case ServerPhase::kActive: return L"运行正常";
+    case ServerPhase::kDegraded: return L"部分功能不可用";
   }
-  return L"Unknown";
+  return L"未知状态";
 }
 
 }  // namespace pdb::app

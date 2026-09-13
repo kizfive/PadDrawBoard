@@ -11,6 +11,10 @@ namespace pdb::video {
 [[nodiscard]] D3D11_TEXTURE2D_DESC NormalizePrivateCopyTextureDesc(
     const D3D11_TEXTURE2D_DESC& source_desc) noexcept;
 
+[[nodiscard]] bool ShouldReusePrivateCopyTexture(
+    const D3D11_TEXTURE2D_DESC& cached_desc,
+    const D3D11_TEXTURE2D_DESC& source_desc) noexcept;
+
 enum class CaptureResult { kFrameAvailable, kTimeout, kRecovered, kFatalError };
 
 // Uses a private default-usage copy of the duplication surface, so the caller
@@ -42,6 +46,9 @@ class DesktopDuplicationCapture final {
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<IDXGIOutput1> output_;
   ComPtr<IDXGIOutputDuplication> duplication_;
+  ComPtr<ID3D11Texture2D> private_copy_texture_;
+  D3D11_TEXTURE2D_DESC private_copy_desc_{};
+  bool private_copy_desc_valid_{};
   Size size_{};
   std::uint64_t sequence_{};
 };

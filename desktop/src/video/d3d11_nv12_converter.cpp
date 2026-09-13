@@ -24,6 +24,9 @@ HRESULT D3D11Nv12Converter::Initialize(ID3D11Device* device) {
 }
 
 void D3D11Nv12Converter::Reset() {
+  cached_output_texture_.Reset();
+  cached_output_device_.Reset();
+  cached_output_key_ = {};
   processor_.Reset();
   enumerator_.Reset();
   video_context_.Reset();
@@ -96,6 +99,7 @@ HRESULT D3D11Nv12Converter::Configure(Size input_size, DXGI_FORMAT input_format,
 }
 
 HRESULT D3D11Nv12Converter::Convert(ID3D11Texture2D* bgra_source, Size output_size,
+                                    bool allow_output_texture_reuse,
                                     ComPtr<ID3D11Texture2D>* nv12_output) {
   last_failure_stage_ = "convert_arguments";
   if (bgra_source == nullptr || nv12_output == nullptr || !device_ || !video_device_) return E_POINTER;
@@ -120,9 +124,18 @@ HRESULT D3D11Nv12Converter::Convert(ID3D11Texture2D* bgra_source, Size output_si
   destination.Usage = D3D11_USAGE_DEFAULT;
   destination.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
   ComPtr<ID3D11Texture2D> nv12;
-  last_failure_stage_ = "create_nv12_texture";
-  hr = device_->CreateTexture2D(&destination, nullptr, &nv12);
-  if (FAILED(hr)) return hr;
+  const Nv12TextureCacheKey requested_key{{destination.Width, destination.Height},
+                                           destination.Format};
+  const bool reuse_cached = ShouldReuseNv12OutputTexture(
+      allow_output_texture_reuse, cached_output_key_, requested_key,
+      cached_output_device_.Get() == device_.Get());
+  if (reuse_cached) {
+    nv12 = cached_output_texture_;
+  } else {
+    last_failure_stage_ = "create_nv12_texture";
+    hr = device_->CreateTexture2D(&destination, nullptr, &nv12);
+    if (FAILED(hr)) return hr;
+  }
 
   D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc{};
   input_desc.FourCC = 0;
@@ -153,6 +166,14 @@ HRESULT D3D11Nv12Converter::Convert(ID3D11Texture2D* bgra_source, Size output_si
   last_failure_stage_ = "video_processor_blt";
   hr = video_context_->VideoProcessorBlt(processor_.Get(), output_view.Get(), 0, 1, &stream);
   if (FAILED(hr)) return hr;
+  if (allow_output_texture_reuse) {
+    // The asynchronous caller must ensure the previous ProcessInput has
+    // completed successfully through ProcessOutput before calling Convert
+    // again. VideoPipeline's in-flight encode guard provides that invariant.
+    cached_output_texture_ = nv12;
+    cached_output_device_ = device_;
+    cached_output_key_ = requested_key;
+  }
   *nv12_output = std::move(nv12);
   return S_OK;
 }

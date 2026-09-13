@@ -15,19 +15,20 @@ import java.nio.ByteBuffer
 class AvcDecoder(
     private var surface: Surface,
     private val requestIdr: () -> Unit,
-    private val dropped: () -> Unit,
+    private val dropped: (Long) -> Unit,
+    private val createDecoder: () -> MediaCodec = { MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC) },
 ) : AutoCloseable {
-    private data class Frame(val bytes: ByteArray, val timestampUs: Long, val keyFrame: Boolean)
+    private val inbox = VideoFrameInbox()
 
     private val callbackThread = HandlerThread("PadDrawBoardAvc").also { it.start() }
     private val handler = Handler(callbackThread.looper)
     private val recovery = DecoderRecoveryState()
     private var codec: MediaCodec? = null
-    private var pending: Frame? = null
+    private var pending: VideoFrameInbox.Frame? = null
     private val availableInputs = ArrayDeque<Int>()
     private var configuredWidth = 0
     private var configuredHeight = 0
-    private var closed = false
+    @Volatile private var closed = false
     private var idrRequested = false
 
     fun configure(width: Int, height: Int) {
@@ -58,23 +59,45 @@ class AvcDecoder(
     }
 
     fun queue(accessUnit: ByteArray, timestampUs: Long, keyFrame: Boolean) {
-        post {
-            if (closed || codec == null) return@post
-            if (!recovery.acceptFrame(keyFrame)) {
-                dropped()
-                requestIdrOnceOnThread()
-                return@post
+        if (!inbox.offer(VideoFrameInbox.Frame(accessUnit, timestampUs, keyFrame))) return
+        post(::deliverNextOnThread)
+    }
+
+    private fun deliverNextOnThread() {
+        if (closed) return
+        // Let the asynchronous input callback consume the pending frame first.
+        if (pending != null) {
+            handler.postDelayed(::deliverNextOnThread, 2)
+            return
+        }
+        try {
+            val delivery = inbox.take() ?: return
+            val frame = delivery.frame
+            if (closed) return
+            if (delivery.dropped > 0) {
+                dropped(delivery.dropped)
+                recoverReferencesOnThread()
             }
-            if (pending != null && !recovery.canReplacePending(pending!!.keyFrame, keyFrame)) {
-                dropped()
-                return@post
+            if (codec == null && frame.keyFrame) createCodecOnThread()
+            if (codec == null || !recovery.acceptFrame(frame.keyFrame)) {
+                dropped(1)
+                requestIdrOnceOnThread()
+                return
+            }
+            if (pending != null && !recovery.canReplacePending(pending!!.keyFrame, frame.keyFrame)) {
+                // A missing reference invalidates all following inter frames.
+                dropped(1)
+                recoverReferencesOnThread()
+                return
             }
             if (pending != null) {
                 pending = null
-                dropped()
+                dropped(1)
             }
-            pending = Frame(accessUnit, timestampUs, keyFrame)
+            pending = frame
             drainInputOnThread()
+        } finally {
+            if (inbox.finishDelivery()) post(::deliverNextOnThread)
         }
     }
 
@@ -90,7 +113,9 @@ class AvcDecoder(
             if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1)
         }
         try {
-            val decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val decoder = createDecoder()
+            // Own the instance before any callback/configuration/start can fail.
+            codec = decoder
             decoder.setCallback(object : MediaCodec.Callback() {
                 override fun onInputBufferAvailable(callbackCodec: MediaCodec, index: Int) {
                     if (callbackCodec !== codec || closed) return
@@ -114,11 +139,10 @@ class AvcDecoder(
                 }
             }, handler)
             decoder.configure(format, surface, null, 0)
-            codec = decoder
             decoder.start()
         } catch (_: Throwable) {
             recovery.codecError()
-            codec = null
+            releaseCodecOnThread()
             requestIdrOnceOnThread()
         }
     }
@@ -130,9 +154,8 @@ class AvcDecoder(
         try {
             val buffer: ByteBuffer = decoder.getInputBuffer(inputIndex) ?: throw IllegalStateException("decoder input buffer unavailable")
             if (frame.bytes.size > buffer.capacity()) {
-                dropped()
-                pending = null
-                requestIdrOnceOnThread()
+                // Recreate to return the acquired input slot and reset references.
+                handleCodecErrorOnThread()
                 return
             }
             buffer.clear()
@@ -148,11 +171,22 @@ class AvcDecoder(
     private fun handleCodecErrorOnThread() {
         if (closed) return
         recovery.codecError()
+        if (pending != null) dropped(1)
         pending = null
         availableInputs.clear()
         idrRequested = false
         releaseCodecOnThread()
         createCodecOnThread()
+        requestIdrOnceOnThread()
+    }
+
+    private fun recoverReferencesOnThread() {
+        // IDR resets AVC references without destroying the codec or its input slots.
+        // Recreating here stalls callbacks and makes the next burst overflow again.
+        recovery.codecError()
+        if (pending != null) dropped(1)
+        pending = null
+        idrRequested = false
         requestIdrOnceOnThread()
     }
 
@@ -176,6 +210,7 @@ class AvcDecoder(
     override fun close() {
         if (closed) return
         closed = true
+        inbox.close()
         handler.post {
             recovery.close()
             releaseCodecOnThread()

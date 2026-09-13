@@ -16,6 +16,15 @@
 namespace pdb::video {
 
 using Microsoft::WRL::ComPtr;
+
+// Adopt an API-transferred reference without AddRef. The MinGW WRL shipped
+// with some toolchains incorrectly AddRefs in Attach(), unlike Microsoft WRL.
+// Use the normal COM out-parameter storage to keep ownership identical on both.
+template <class Interface>
+void AdoptComReference(ComPtr<Interface>& destination, Interface* owned) noexcept {
+  *destination.ReleaseAndGetAddressOf() = owned;
+}
+
 using SteadyTime = std::chrono::steady_clock::time_point;
 
 struct Size {
@@ -64,6 +73,17 @@ struct EncodedAccessUnit {
   // Set by the encoder when the output sample is actually completed.
   SteadyTime encoded_at{};
 };
+
+// Reset reusable encoded output metadata without releasing the access-unit
+// allocation. The encoder fills bytes with assign(), so retaining its capacity
+// avoids a large allocation/free cycle on every video frame.
+inline void ResetEncodedAccessUnit(EncodedAccessUnit& output) noexcept {
+  output.bytes.clear();
+  output.sequence = 0;
+  output.is_idr = false;
+  output.acquired_at = {};
+  output.encoded_at = {};
+}
 
 inline constexpr HRESULT kErrFrameFormatUnsupported =
     MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x502);

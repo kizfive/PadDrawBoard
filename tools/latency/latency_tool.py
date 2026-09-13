@@ -118,6 +118,10 @@ def _clock_sample(record: Mapping[str, Any]) -> tuple[float, float] | None:
 
 def _latency_ms(record: Mapping[str, Any], category: str) -> float | None:
     if category == "glass":
+        # Desktop video_sample ends at encoder completion, not physical display.
+        # Only explicitly classified glass measurements may satisfy release gates.
+        if _kind(record) not in {"glass_sample", "glass_to_glass"}:
+            return None
         direct = _first(record, ("glass_to_glass_ms", "glass_latency_ms"))
         if direct is not None:
             return _number(direct, "glass latency")
@@ -125,7 +129,7 @@ def _latency_ms(record: Mapping[str, Any], category: str) -> float | None:
         present = _timestamp_alias(record, ("presentation_timestamp_ns", "present_timestamp_ns", "present_ns", "displayed_ns"))
         if capture is not None and present is not None:
             return (present - capture) / 1_000_000.0
-        if _kind(record) in {"glass_sample", "glass_to_glass", "video_sample"} and "latency_ms" in record:
+        if "latency_ms" in record:
             return _number(record["latency_ms"], "latency_ms")
     else:
         direct = _first(record, ("input_transport_ms", "transport_latency_ms"))
