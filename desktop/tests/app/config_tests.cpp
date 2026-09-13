@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <span>
 
 namespace {
@@ -95,6 +96,64 @@ void TestTelemetrySchemaAndReadiness() {
   assert(!pdb::app::ComputeReleaseReady(true, false, true, true, true));
   assert(!pdb::app::ComputeReleaseReady(true, true, false, true, true));
   assert(pdb::app::ComputeReleaseReady(true, true, true, true, true));
+}
+
+void TestTelemetryWriterPersistentStreamAndRotation() {
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      (L"PadDrawBoard-telemetry-test-" + std::to_wstring(GetCurrentProcessId()));
+  const std::filesystem::path path = directory / L"nested" / L"telemetry.jsonl";
+  const std::filesystem::path copy = directory / L"copy.jsonl";
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+
+  {
+    pdb::app::TelemetryWriter writer(path);
+    writer.Write("first");
+    writer.Write("second");
+
+    std::string initial;
+    {
+      std::ifstream before_rotation(path, std::ios::binary);
+      initial.assign(std::istreambuf_iterator<char>(before_rotation), {});
+    }
+    assert(initial == "first\nsecond\n");
+    std::string error;
+    assert(writer.CopyTo(copy, &error));
+    std::string copied_text;
+    {
+      std::ifstream copied(copy, std::ios::binary);
+      copied_text.assign(std::istreambuf_iterator<char>(copied), {});
+    }
+    assert(copied_text == initial);
+
+    const std::string large(2'000'000, 'x');
+    const std::string rotation_trigger(200'000, 'y');
+    writer.Write(large);
+    writer.Write(large);
+    writer.Write(rotation_trigger);
+    writer.Write("after-rotation");
+
+    assert(std::filesystem::exists(
+        std::filesystem::path(path.wstring() + L".1")));
+    std::string current_text;
+    {
+      std::ifstream current(path, std::ios::binary);
+      current_text.assign(std::istreambuf_iterator<char>(current), {});
+    }
+    assert(current_text == rotation_trigger + "\nafter-rotation\n");
+    writer.Write("after-copy");
+    assert(writer.CopyTo(copy, &error));
+    std::string copied_latest_text;
+    {
+      std::ifstream copied_latest(copy, std::ios::binary);
+      copied_latest_text.assign(
+          std::istreambuf_iterator<char>(copied_latest), {});
+    }
+    assert(copied_latest_text ==
+           rotation_trigger + "\nafter-rotation\nafter-copy\n");
+  }
+  std::filesystem::remove_all(directory, ignored);
 }
 
 void TestDynamicClientCapabilityReadiness() {
@@ -184,6 +243,7 @@ int main() {
   TestRoundTripAndAtomicReplacement();
   TestInvalidSchemaFallsBackSafely();
   TestTelemetrySchemaAndReadiness();
+  TestTelemetryWriterPersistentStreamAndRotation();
   TestDynamicClientCapabilityReadiness();
   TestTrayCommandLogic();
   TestSessionAuthPreface();

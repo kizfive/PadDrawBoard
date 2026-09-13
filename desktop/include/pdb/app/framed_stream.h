@@ -59,11 +59,13 @@ class ResumableFrameWriter final {
   [[nodiscard]] std::size_t size() const noexcept { return bytes_.size(); }
   void Clear() noexcept {
     bytes_.clear();
+    payload_scratch_.clear();
     offset_ = 0;
   }
 
  private:
   std::vector<std::uint8_t> bytes_;
+  std::vector<std::uint8_t> payload_scratch_;
   std::size_t offset_{};
 };
 

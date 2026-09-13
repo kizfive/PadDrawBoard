@@ -17,13 +17,16 @@ import android.os.SystemClock
 import android.util.Log
 
 /** Connects device loopback ports that adb reverse maps to the desktop listeners. */
-class AdbSession(private val listener: Listener, sessionToken: ByteArray) : AutoCloseable {
+class AdbSession(private val listener: Listener, sessionToken: ByteArray,
+    private val ports: List<Int> = listOf(48100, 48101, 48102),
+) : AutoCloseable {
     interface Listener { fun onControl(frame: PdbProtocol.Frame); fun onVideo(frame: PdbProtocol.Frame); fun onState(status: String, connected: Boolean); fun onFailure(error: Throwable) }
     private val codec = PdbCodec(); private val running = AtomicBoolean(); private val reconnecting = AtomicBoolean()
     private val sessionToken = sessionToken.clone()
     private val executor = Executors.newScheduledThreadPool(3); private val sockets = CopyOnWriteArraySet<Socket>()
-    private val inputExecutor = Executors.newSingleThreadExecutor()
-    private val controlExecutor = Executors.newSingleThreadExecutor()
+    private val inputExecutor = boundedWriter()
+    private val controlExecutor = boundedWriter()
+    private val generation = AtomicLong()
     private val controlSequence = AtomicLong(); private val inputSequence = AtomicLong()
     private val controlLock = Any(); private val inputLock = Any()
     private val telemetryClock = TelemetryClock { SystemClock.elapsedRealtimeNanos() }
@@ -36,17 +39,22 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
     private var telemetry: ScheduledFuture<*>? = null
     fun start(hello: ClientCapabilities) { if (running.compareAndSet(false, true)) { lastHello = hello; connect(hello) } }
     private fun connect(hello: ClientCapabilities) { executor.execute {
+        val attempt = generation.get()
         try {
-            listener.onState("Connecting through adb reverse", false)
-            val controlSocket = open(48100); val videoSocket = open(48101); val inputSocket = open(48102); sockets.addAll(listOf(controlSocket, videoSocket, inputSocket))
+            if (!running.get()) return@execute
             failureNotified.set(false)
+            listener.onState("Connecting through adb reverse", false)
+            val controlSocket = open(ports[0], attempt); val videoSocket = open(ports[1], attempt); val inputSocket = open(ports[2], attempt)
             val controlOutput = controlSocket.getOutputStream()
             val videoOutput = videoSocket.getOutputStream()
             val inputOutput = inputSocket.getOutputStream()
             SessionAuth.writePreface(controlOutput, sessionToken, SessionAuth.Channel.CONTROL)
             SessionAuth.writePreface(videoOutput, sessionToken, SessionAuth.Channel.VIDEO)
             SessionAuth.writePreface(inputOutput, sessionToken, SessionAuth.Channel.INPUT)
-            input = inputOutput; control = controlOutput
+            synchronized(sockets) {
+                if (!running.get() || generation.get() != attempt) return@execute
+                input = inputOutput; control = controlOutput
+            }
             if (!writeControl(codec.hello(hello, controlSequence.incrementAndGet()))) {
                 scheduleReconnect(hello)
                 return@execute
@@ -58,7 +66,7 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
                 sendControl(request)
                 sendControl(telemetryClock.telemetry(droppedVideoFrames.get()))
             }, 1, 1, TimeUnit.SECONDS)
-        } catch (error: Throwable) { if (running.get()) { listener.onFailure(error); scheduleReconnect(hello) } }
+        } catch (error: Throwable) { if (running.get() && generation.get() == attempt) { notifyTransportFailure(error, hello) } }
     } }
     fun sendInput(samples: List<CapturedInputSample>, width: Int, height: Int) {
         if (samples.isEmpty()) return
@@ -73,7 +81,7 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
                         pendingSamples.chunked(PdbProtocol.MAX_INPUT_SAMPLES).forEach { chunk ->
                             codec.write(stream, codec.input(chunk, width, height, inputSequence.incrementAndGet()))
                         }
-                    }.onFailure { notifyTransportFailure(it) }
+                    }.onFailure { if (input === stream) notifyTransportFailure(it) }
                 }
             }
         } catch (error: RejectedExecutionException) {
@@ -87,14 +95,14 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
                 synchronized(controlLock) {
                     if (control !== stream) return@synchronized
                     runCatching { codec.write(stream, codec.control(message, controlSequence.incrementAndGet())) }
-                        .onFailure { notifyTransportFailure(it) }
+                        .onFailure { if (control === stream) notifyTransportFailure(it) }
                 }
             }
         } catch (error: RejectedExecutionException) {
             if (running.get()) notifyTransportFailure(error)
         }
     }
-    fun recordDroppedVideoFrame() { droppedVideoFrames.incrementAndGet() }
+    fun recordDroppedVideoFrame(count: Long = 1) { droppedVideoFrames.addAndGet(count) }
     fun recordVideoFrame(hostPresentationTimestampNs: Long, receivedNs: Long = SystemClock.elapsedRealtimeNanos()) {
         telemetryClock.recordVideo(hostPresentationTimestampNs, receivedNs)
     }
@@ -102,11 +110,26 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
         synchronized(controlLock) {
             val stream = control ?: return false
             val result = runCatching { codec.write(stream, frame) }
-            result.onFailure { notifyTransportFailure(it) }
+            result.onFailure { if (control === stream) notifyTransportFailure(it) }
             return result.isSuccess
         }
     }
-    private fun open(port: Int) = Socket().apply { tcpNoDelay = true; connect(InetSocketAddress("127.0.0.1", port), 2_000) }
+    private fun open(port: Int, attempt: Long): Socket {
+        val socket = synchronized(sockets) {
+            check(running.get() && generation.get() == attempt) { "Connection attempt cancelled" }
+            // Register before connecting: partial initialization and close() own it too.
+            Socket().also { sockets.add(it) }
+        }
+        try {
+            socket.tcpNoDelay = true
+            socket.connect(InetSocketAddress("127.0.0.1", port), 2_000)
+            return socket
+        } catch (error: Throwable) {
+            sockets.remove(socket)
+            runCatching { socket.close() }
+            throw error
+        }
+    }
     private fun read(socket: Socket, consume: (PdbProtocol.Frame) -> Unit, hello: ClientCapabilities, controlChannel: Boolean) {
         try {
             socket.getInputStream().use {
@@ -116,7 +139,7 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
                     consume(frame)
                 }
             }
-        } catch (error: Throwable) { if (running.get()) notifyTransportFailure(error, hello) }
+        } catch (error: Throwable) { if (running.get() && sockets.contains(socket)) notifyTransportFailure(error, hello) }
     }
     private fun handleControl(frame: PdbProtocol.Frame) {
         val control = (frame.payload as? PdbProtocol.ControlPayload)?.control ?: return
@@ -136,14 +159,23 @@ class AdbSession(private val listener: Listener, sessionToken: ByteArray) : Auto
     private fun notifyTransportFailure(error: Throwable, hello: ClientCapabilities? = lastHello) {
         if (!running.get() || !failureNotified.compareAndSet(false, true)) return
         Log.e("PadDrawBoard", "Transport failure; reconnecting", error)
-        listener.onFailure(error)
         if (hello != null) scheduleReconnect(hello)
+        listener.onFailure(error)
     }
     private fun scheduleReconnect(hello: ClientCapabilities) {
         if (!reconnecting.compareAndSet(false, true)) return
         telemetry?.cancel(false); telemetry = null
-        listener.onState("Reconnecting", false); sockets.forEach { runCatching { it.close() } }; sockets.clear(); input = null; control = null
+        closeSockets()
+        listener.onState("Reconnecting", false)
         reconnect?.cancel(false); reconnect = executor.schedule({ reconnecting.set(false); if (running.get()) connect(hello) }, 1, TimeUnit.SECONDS)
     }
-    override fun close() { running.set(false); telemetry?.cancel(true); reconnect?.cancel(true); input = null; control = null; sockets.forEach { runCatching { it.close() } }; sockets.clear(); inputExecutor.shutdownNow(); controlExecutor.shutdownNow(); executor.shutdownNow() }
+    private fun closeSockets() = synchronized(sockets) {
+        generation.incrementAndGet()
+        input = null; control = null
+        val owned = sockets.toList()
+        sockets.clear()
+        owned.forEach { runCatching { it.close() } }
+        inputExecutor.queue.clear(); controlExecutor.queue.clear()
+    }
+    override fun close() { running.set(false); telemetry?.cancel(true); reconnect?.cancel(true); closeSockets(); inputExecutor.shutdownNow(); controlExecutor.shutdownNow(); executor.shutdownNow() }
 }

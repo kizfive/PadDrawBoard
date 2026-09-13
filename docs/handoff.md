@@ -1,4 +1,31 @@
-# PadDrawBoard 当前交接（2026-08-15）
+# PadDrawBoard 当前交接
+
+## 2026-09-13：最新本地快照
+
+本快照包含上一轮冻结恢复、Android 可靠性/资源释放、Windows 混合显卡视频管线、MFT 引用生命周期、协议遥测和测试补丁。新增或更新的重点组件包括：Android 有界发送队列与四帧视频入口 FIFO、解码器等待 IDR/有限重建状态机、Windows 帧 pacing 与编码器待处理输入门控、adapter-scoped H.264 MFT 选择、输出 sample 复用和异步 MFT 关闭、视频内存探针，以及对应的原生/Android/延迟分析测试。
+
+本地验证结果：
+
+- `python -m unittest discover -s tools/latency -p "test_*.py" -v`：7/7 通过。
+- MinGW 原生构建（`PDB_BUILD_TESTS=ON`）：成功；CTest：7/7 通过。
+- Android `testDebugUnitTest assembleDebug assembleDebugAndroidTest`：构建成功。
+- `git diff --check`：通过；尚未把设备安装、真实显示链路或一小时 soak 结果外推为本地自动化验证结论。
+
+下一位接手者先检查 `git status --short --branch` 和最新提交，再观察 GitHub Actions。`cert_backup/` 仅是本机证书备份，已加入忽略规则，不应上传；`build/`、`out/`、`artifacts/` 仍是本地生成目录。
+
+## 2026-09-12 16:39：冻结回归修正并实机恢复
+
+查明日常路径仍在运行 8 月旧版 Windows 程序并发生崩溃；已备份并更新 `D:\PadDrawBoard`。同时纠正上一轮 Android 单帧入口与过度重建导致的恢复循环，改为四帧有界 FIFO、等待输入槽、参考帧丢失仅等待 IDR。最终 APK 已安装，Android 33 项单测通过；一分钟七次实机采样持续产帧、丢帧 0、重置计数不再增长，私有内存约 112–114 MiB。详见 [冻结复查](freeze-recovery-20260912.md)。此前安装受限状态和单帧入口方案已被本节取代。
+
+## 2026-09-12：Android 可靠性与遥测补丁
+
+已分点修复视频/发送入口队列、参考帧恢复、初始化失败资源释放，以及丢帧统计和端到端延迟误判。Android 单测 32 项、延迟工具 7 项通过；APK 与设备测试 APK 已构建。HyperOS 拒绝 USB 安装，设备失败路径测试与新版本实机复测尚未完成，正等待用户确认安装提示。详细实现、设备安装状态和继续命令见 [本轮修复记录](android-reliability-fixes.md)。以下较早记录按日期保留，当前状态以本节和对应报告为准。
+
+## 2026-09-06：内存增长根因已修复
+
+下文历史记录中“NVIDIA MFT 自身泄漏”的归因已被新证据纠正：本机 MinGW 的 `ComPtr::Attach()` 额外 AddRef，导致输出 sample、事件集合和 CodecAPI 引用无法释放。已改为明确接管引用并补充异步 MFT 关闭，保留 NVIDIA 硬件编码。120 秒反复 IDR 压力测试通过，便携版已连接平板验证。完整证据、剩余门槛和后续优化见 [内存分析](memory-analysis.md)。
+
+以下保留 2026-08-15 的历史交接，若结论冲突以上述新记录为准。
 
 > 本节是当前事实来源。下方“历史交接”保留早期基线记录，其中部分状态已被本轮实机修复取代。
 
@@ -10,8 +37,8 @@
 - Windows 托盘界面已精简并中文化；Windows 与 Android 均已接入新的 PadDrawBoard 应用图标。
 - 本轮最后验证：Windows CTest 7/7 通过，Android `testDebugUnitTest` 与 `assembleDebug` 通过，Debug APK 已覆盖安装并成功启动。
 - 接手会话复验（2026-08-15 凌晨）：Windows（MinGW）构建通过、CTest 7/7；Android `testDebugUnitTest` 与 `assembleDebug` 通过。
-- 接手会话还发现一个**未解决**的严重问题：在一台 AMD 核显 + NVIDIA 独显混合显卡的机器上，视频画面在会话建立后约 15-25 秒永久冻结（触控与控制通道不受影响、无会话断开）；同一份最新代码在纯 Intel 核显机器上实时刷新正常。完整排查记录见下文专节。
-- 本机测试时曾同时运行 MuMu 模拟器远程服务、Wallpaper Engine 与 NVIDIA App 浮窗等屏幕相关组件，已全部停用，但冻结未解除。
+- AMD 780M 核显 + NVIDIA RTX 4060 独显机器上的 15-25 秒永久冻结已经修复：实机连续运行超过两分钟，视频约 62 fps、无断流、无队列增长；完整根因与验证记录见下文专节。
+- 仍有一个独立的 NVIDIA Media Foundation MFT 内存增长问题：编码开启时私有内存约增加 1.5 MB/s；捕获单独运行稳定，20/80 Mbps 斜率相同，应用侧遥测、协议和 sample 所有权修复均不改变斜率。正式一小时稳定性验收前必须解决或通过进程隔离/其他编码后端规避。
 
 架构、构建前置条件和完整验收方法不在此重复，分别参见：
 
@@ -51,54 +78,45 @@
 
 最近一次部署后，Windows 和 Android 进程均正常运行，三个通道均为已连接状态。设备序列号和任何本机账户信息不要写入仓库或日志样例。
 
-**注意**：工作区中当前有 6 个文件未提交的排查/修复改动（见下方排查记录），下次会话先确认其状态再构建。
+**注意**：本交接记录覆盖当前代码快照及已知门槛；下次会话仍应先运行 `git status --short --branch` 确认工作区。`cert_backup/` 属于本机材料，不得加入提交。
 
-## 视频冻结排查记录（2026-08-15，未解决）
+## 混合显卡视频排查记录（2026-08-15）
 
-> 本机指 AMD 核显 + NVIDIA 独显混合显卡的 Windows 机器；参考机为纯 Intel 核显机器（最新代码在该机上实时刷新与触控均正常）。
+### 冻结根因与修复
 
-### 现象
+- 冻结进程转储先后显示视频线程阻塞在 `IDXGIOutputDuplication::ReleaseFrame` 和 `AcquireNextFrame`，同时 NVIDIA NVENC MFT 工作线程位于驱动调用内。
+- `VideoLoop` 原先提交异步编码输入后立即再次进入 Desktop Duplication，只在下一次捕获成功后才轮询编码输出；这会让桌面复制与 NVENC 在同一驱动队列内互相等待。
+- 现已改为每轮先轮询编码器；有待完成输入时禁止再次进入 `AcquireNextFrame`，输出完成后才恢复捕获。D3D11 设备同时启用 `ID3D10Multithread::SetMultithreadProtected(TRUE)`。
+- H.264 MFT 仅从捕获设备对应的 adapter LUID 通过 `MFTEnum2` 枚举，禁止混合显卡机器选中另一适配器上的硬件编码器。
+- 临时高频阶段日志和循环探针已删除；保留低频适配器/编码器选择诊断。
 
-- 会话建立成功、三通道 `Established`、触控与笔输入正常、客户端能解码并显示启动阶段的首批帧。
-- 会话建立后约 15-25 秒，视频画面永久冻结：桌面端不再采集、不再编码，客户端 `video_latency_us` 归零；控制/输入通道与客户端遥测完全不受影响。
-- 多次运行（Debug 与 Release、MinGW）均可复现；分支提交之前的旧构建同样复现，因此**不是本分支引入的回归**。
+### 实机验证
 
-### 已确认的事实
+- 第一轮连续运行超过两分钟，序号到 8098；保留窗口约 62.24 fps，最大输出间隔 39.05 ms，capture-to-encode 中位数 13.92 ms、p95 15.09 ms，客户端视频延迟中位数 4.28 ms、p95 7.99 ms，丢帧 0、会话错误 0。
+- 删除临时探针后的第二轮约 62.32 fps，最大间隔 32.17 ms，客户端中位数 4.16 ms、p95 9.37 ms，丢帧 0、无错误。
+- UU 远程安装后新增 `GameViewer Virtual Display Adapter`，同一次实机会话仍正常；UU 不是本次冻结根因。
 
-- 桌面端视频循环冻结时进程 CPU 接近 0（阻塞等待，不是忙循环）；控制线程仍在每秒写遥测。
-- 循环心跳探针（`video_loop_probe` 遥测）显示视频循环在启动后第 50~190 次迭代之间停摆，冻结点漂移（竞态特征）。
-- 编码器阶段日志（`%APPDATA%\PadDrawBoard\encoder_stages.log`）显示最后一条记录停在异步编码路径的 `Poll end` 之后、下一轮循环之前。
-- 编码器为异步的 NVIDIA H.264 Encoder MFT（NVENC）；`nvidia-smi` 确认 PadDrawBoard 进程运行在独立显卡上。
-- 已排除：MuMu 远程服务（已停用并禁用）、Wallpaper Engine（已退出）、NVIDIA App 浮窗（已退出）、旧版代码回归、同步 MFT 重协商死锁假设。
-- 连带问题：本机 adb 服务器曾多次整体挂死（`adb shell` 与 `kill-server` 均超时），强杀进程并重启服务器可恢复；与视频冻结是否同源未确认。
+### 尚未解决：NVIDIA MFT 内存增长
 
-### 工作区中未提交的代码改动（6 个文件，均为排查遗留）
-
-- `desktop/src/app/desktop_server.cpp`：`EndSession` 在会话未激活时也写 `pre-active:` 遥测（建议保留）；`video_loop_probe` 心跳遥测（临时，可删）。
-- `desktop/src/video/h264_encoder.cpp`：同步路径 stream-change 后不再立即重入阻塞式 `ProcessOutput`（防御性修复，建议保留）；异步路径 stream-change 改为整体重建编码器实例、新增 `PerformFormalStreamReset`（针对 NVENC 中途 `SetOutputType` 挂死的修复，**未能解除冻结**）；临时 `EncoderStageLog` 阶段日志（删除前先保留可复现）。
-- `desktop/include/pdb/video/telemetry.h`、`desktop/include/pdb/app/desktop_server.h`、`desktop/src/video/video_pipeline.cpp`：`OnEncoderSelected` 遥测接口（保留有助于诊断，可斟酌）。
-- 另存在分支提交前的对照构建工作树（用于差分测试），可复现生成，无需保留。
-
-### 下一步排查建议（按优先级）
-
-1. 对冻结中的进程做线程栈转储（procdump/WinDbg），确认阻塞调用点；现有证据已把它缩小到异步编码调用尾部到下一轮循环之间。
-2. 停用 SuperDisplay 服务后复测（本机另一屏幕捕获类组件，尚未排除）。
-3. 对照实验：在 NVIDIA 控制面板把 PadDrawBoard 强制到核显运行，验证"独显 NVENC + 桌面复制"是否就是冲突源；若核显可用，可考虑软件编码回退方案。
-4. 单独排查 adb 服务器挂死（本机同时存在多个 adb 版本，建议统一使用 36.0.2）。
-5. 结案后清理全部临时诊断代码并补原生测试，再考虑推送分支。
+- 正常编码时进程私有内存约线性增加 1.5 MB/s；capture-only 20 秒仅 65.35→65.73 MB，已排除 DXGI 捕获。
+- 关闭高频遥测、丢弃编码输出且不做协议序列化/网络发送时斜率不变，已排除日志、协议、TCP 与 Android 解码。
+- 20 Mbps 与 80 Mbps 斜率相同，说明增长不随码流大小变化。
+- 已修复并测试 caller-provided 输出 sample 复用、替换 `pSample` 的 COM 所有权、输入 sample 在 `MFT_INPUT_STREAM_DOES_NOT_ADDREF` 条件下的安全复用；实机斜率仍不变。
+- 系统软件 H.264 MFT 在当前 D3D 零拷贝输入配置下无可用候选（`E_NOTIMPL`）。若继续做软件回退，需要新增 GPU→CPU 回读与 CPU NV12 输入，这属于显著的延迟/架构取舍。
+- 推荐下一步优先选择视频工作进程隔离并按内存/时间安全轮换，或引入另一套系统/厂商编码后端；不要在主进程内无限运行当前 NVENC MFT。
 
 ## 建议后续验证
 
 1. 在 Blender 中分别验证笔压、连续笔划、单指点击/拖动和多指手势，确认应用级行为与 Windows 原生触摸注入一致。
-2. 完成 `docs/testing.md` 中的一小时稳定性测试；当前只完成了短时实机回归。
+2. 先解决或隔离 NVIDIA MFT 内存增长，再完成 `docs/testing.md` 中的一小时稳定性测试；当前只完成了两分钟级实机回归。
 3. 在另一台不同 DPI/方向的 Android 平板上复测坐标、状态栏手势边界和自适应图标裁切。
 4. 继续核实 Xiaomi Focus Pen 的按键与悬停硬件事件；未观测到的能力不得标记为支持。
 5. 推送后观察 GitHub Actions；若 Windows 编码器测试在其他驱动环境失败，优先保留并分析失败 stage 与 HRESULT。
 6. 若本地 SDK/工具链位置发生过迁移，用新位置完整跑一次 Windows 打包脚本，确认 cmake 与 platform-tools 引用正常。
 7. 重启 adb 并复测三通道，确认控制、视频、输入通道恢复正常。
-8. 按"视频冻结排查记录"继续定位混合显卡机器的视频冻结；修复前不要在该机器上宣称视频可用。
-9. 混合显卡机器结案后，在纯 Intel 核显参考机上复跑一轮验证，确认修复没有破坏原有环境。
-10. 处理工作区中未提交的排查改动：保留防御性修复、删除临时日志，补测试后提交。
+8. 为 NVIDIA MFT 内存增长实现有界恢复方案；在完成一小时测试前不要宣称长期稳定性达标。
+9. 在纯 Intel 核显参考机上复跑一轮验证，确认混合显卡冻结修复没有破坏原有环境。
+10. 推送后检查 `git status --short --branch` 与 GitHub Actions，确认 `cert_backup/` 保持被忽略且不在提交内容中。
 
 ## 建议技能
 

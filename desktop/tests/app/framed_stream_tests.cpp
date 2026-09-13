@@ -114,6 +114,55 @@ paddrawboard::protocol::Frame VideoFrameForTest() {
            paddrawboard::protocol::MessageType::VideoFrame}, std::move(video)};
 }
 
+std::vector<paddrawboard::protocol::Frame> AllFramesForSerializationTest() {
+  using namespace paddrawboard::protocol;
+  auto hello = HelloFrame();
+  ServerConfig config{1234, 7, 3200, 2136, 60, 80, 0, 0, 3200, 2136,
+                      kConfigFlagSuppressTouchWhilePenInRange};
+  InputSample sample{100, 1, ToolType::Pen,
+                     static_cast<std::uint8_t>(kInRange | kContact | kPrimary),
+                     123, 456, 789, -120, 340, 55, kButton1};
+  InputBatch input{987654321, {sample}};
+  std::vector<Frame> frames;
+  frames.push_back(std::move(hello));
+  frames.push_back({{0, 2, MessageType::ServerConfig}, config});
+  frames.push_back(VideoFrameForTest());
+  frames.push_back({{0, 4, MessageType::InputBatch}, input});
+  frames.push_back({{0, 5, MessageType::Control}, Control{ClockSyncRequest{11}}});
+  frames.push_back({{0, 6, MessageType::Control}, Control{ClockSyncResponse{1, 2, 3}}});
+  frames.push_back({{0, 7, MessageType::Control}, Control{ClockSyncComplete{1, 2, 3, 4}}});
+  frames.push_back({{0, 8, MessageType::Control}, Control{RequestIdr{}}});
+  frames.push_back({{0, 9, MessageType::Control}, Control{OrientationChanged{90}}});
+  frames.push_back({{0, 10, MessageType::Control}, Control{CapabilityChanged{kCapabilityPressure}}});
+  frames.push_back({{0, 11, MessageType::Control}, Control{Telemetry{1, 2, 3}}});
+  frames.push_back({{0, 12, MessageType::Control}, Control{Disconnect{4, "done"}}});
+  return frames;
+}
+
+void TestReusableEncodingPreservesWireBytesForEveryPayload() {
+  std::vector<std::uint8_t> frame_output;
+  std::vector<std::uint8_t> payload_scratch;
+  for (const auto& frame : AllFramesForSerializationTest()) {
+    const auto legacy = paddrawboard::protocol::encodeFrame(frame);
+    paddrawboard::protocol::encodeFrame(frame, frame_output, payload_scratch);
+    assert(frame_output == legacy);
+  }
+}
+
+void TestReusableEncodingRetainsLargeVideoCapacities() {
+  const auto frame = VideoFrameForTest();
+  std::vector<std::uint8_t> frame_output;
+  std::vector<std::uint8_t> payload_scratch;
+  paddrawboard::protocol::encodeFrame(frame, frame_output, payload_scratch);
+  const auto frame_capacity = frame_output.capacity();
+  const auto payload_capacity = payload_scratch.capacity();
+  for (int i = 0; i < 8; ++i) {
+    paddrawboard::protocol::encodeFrame(frame, frame_output, payload_scratch);
+    assert(frame_output.capacity() >= frame_capacity);
+    assert(payload_scratch.capacity() >= payload_capacity);
+  }
+}
+
 void TestExactReadAndWriteHandleShortOperations() {
   const auto source = paddrawboard::protocol::encodeFrame(HelloFrame());
   MemoryStream reader(source, 2);
@@ -234,6 +283,8 @@ void TestVideoBackpressureStateNotifiesOnceRecoversAndTimesOut() {
 }  // namespace
 
 int main() {
+  TestReusableEncodingPreservesWireBytesForEveryPayload();
+  TestReusableEncodingRetainsLargeVideoCapacities();
   TestExactReadAndWriteHandleShortOperations();
   TestReaderRejectsOversizedLengthBeforeAllocation();
   TestReaderReportsTruncatedHeader();

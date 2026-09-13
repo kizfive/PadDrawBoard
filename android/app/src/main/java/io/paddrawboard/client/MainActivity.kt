@@ -94,7 +94,10 @@ class MainActivity : Activity() {
         if (!surfaceReady) return
         val current = decoder
         if (current == null) {
-            decoder = AvcDecoder(capture.holder.surface, { session?.sendControl(PdbProtocol.RequestIdr) }, { state.update { value -> value.copy(droppedVideoFrames = value.droppedVideoFrames + 1) } })
+            decoder = AvcDecoder(capture.holder.surface, { session?.sendControl(PdbProtocol.RequestIdr) }, { count ->
+                session?.recordDroppedVideoFrame(count)
+                state.update { value -> value.copy(droppedVideoFrames = value.droppedVideoFrames + count) }
+            })
             decoder?.configure(config.videoWidth, config.videoHeight)
         } else {
             current.reconfigure(capture.holder.surface, config.videoWidth, config.videoHeight)

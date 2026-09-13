@@ -29,7 +29,10 @@ class DecoderRecoveryStateTest {
 
         state.onFrameQueued(keyFrame = true)
         assertEquals(DecoderPhase.RUNNING, state.phase)
-        assertTrue(state.canReplacePending(pendingKeyFrame = false, incomingKeyFrame = false))
+        assertFalse(state.canReplacePending(pendingKeyFrame = false, incomingKeyFrame = false))
+        state.codecError()
+        assertFalse(state.acceptFrame(keyFrame = false))
+        assertTrue(state.acceptFrame(keyFrame = true))
     }
 
     @Test fun acceptedIdrRemainsAwaitingUntilQueue() {

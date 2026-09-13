@@ -57,6 +57,8 @@ struct ParseError { std::string message; };
 template <typename T> using Result = std::variant<T, ParseError>;
 
 std::vector<std::uint8_t> encodeFrame(const Frame& frame);
+void encodeFrame(const Frame& frame, std::vector<std::uint8_t>& frame_output,
+                 std::vector<std::uint8_t>& payload_scratch);
 Result<Frame> decodeFrame(const std::uint8_t* bytes, std::size_t size);
 inline Result<Frame> decodeFrame(const std::vector<std::uint8_t>& bytes) { return decodeFrame(bytes.data(), bytes.size()); }
 

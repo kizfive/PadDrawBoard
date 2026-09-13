@@ -79,6 +79,13 @@ if(MINGW)
 endif()
 
 if(PDB_BUILD_TESTS)
+  # Run manually on a logged-in Windows GPU host, never on a headless runner.
+  add_executable(pdb_video_memory_probe tests/video/video_memory_probe.cpp)
+  target_link_libraries(pdb_video_memory_probe PRIVATE pdb_video psapi)
+  pdb_target_defaults(pdb_video_memory_probe)
+  if(MINGW)
+    target_link_options(pdb_video_memory_probe PRIVATE -mconsole)
+  endif()
   function(pdb_add_native_test target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE ${ARGN})

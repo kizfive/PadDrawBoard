@@ -108,6 +108,7 @@ class DesktopServer final : private video::VideoTelemetrySink {
   void OnCapture(const video::CaptureTelemetry&) override;
   void OnEncode(const video::EncodeTelemetry&) override;
   void OnStreamResetRequested() override;
+  void OnEncoderSelected(const std::wstring& name, bool asynchronous) override;
 
   ServerOptions options_;
   mutable std::mutex mutex_;

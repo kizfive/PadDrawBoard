@@ -112,6 +112,8 @@ class VideoTelemetrySink {
   virtual void OnCapture(const CaptureTelemetry& telemetry) = 0;
   virtual void OnEncode(const EncodeTelemetry& telemetry) = 0;
   virtual void OnStreamResetRequested() = 0;
+  // Optional so existing application sinks remain source-compatible.
+  virtual void OnEncoderSelected(const std::wstring&, bool) {}
   // Optional so existing application sinks remain source-compatible. The
   // video layer calls this for every policy observation and decision.
   virtual void OnResolutionPolicy(const ResolutionPolicyTelemetry&) {}
