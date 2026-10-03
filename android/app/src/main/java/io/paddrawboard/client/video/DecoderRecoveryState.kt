@@ -18,11 +18,10 @@ internal class DecoderRecoveryState {
     }
 
     /**
-     * A queued IDR is the recovery barrier. Until it reaches MediaCodec, an inter frame
-     * must not replace it, otherwise recovery can start with a P frame and remain black.
+     * Only an IDR can replace an unsubmitted frame without breaking references.
      */
     fun canReplacePending(pendingKeyFrame: Boolean, incomingKeyFrame: Boolean): Boolean =
-        !pendingKeyFrame || incomingKeyFrame
+        incomingKeyFrame
 
     /** Advances recovery only after MediaCodec accepted the input buffer. */
     fun onFrameQueued(keyFrame: Boolean): Boolean {

@@ -28,6 +28,7 @@
 local.properties
 signing.properties
 /android-signing/
+/cert_backup/
 
 # Runtime artifacts
 *.log

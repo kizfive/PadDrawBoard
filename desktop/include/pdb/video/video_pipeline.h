@@ -14,6 +14,39 @@
 
 namespace pdb::video {
 
+enum class VideoLoopAfterEncodeAction {
+  kSendOutput,
+  kCapture,
+  kFail,
+};
+
+[[nodiscard]] constexpr VideoLoopAfterEncodeAction DecideVideoLoopAfterInitialEncode(
+    HRESULT encode_result) noexcept {
+  if (encode_result == S_OK) return VideoLoopAfterEncodeAction::kSendOutput;
+  if (encode_result == S_FALSE) return VideoLoopAfterEncodeAction::kCapture;
+  return VideoLoopAfterEncodeAction::kFail;
+}
+
+[[nodiscard]] constexpr bool ShouldEncodeAfterCapture(HRESULT capture_result) noexcept {
+  return capture_result == S_OK;
+}
+
+[[nodiscard]] constexpr bool ShouldAttemptDesktopCapture(bool has_pending_encode) noexcept {
+  return !has_pending_encode;
+}
+
+[[nodiscard]] constexpr bool HasInFlightEncodeState(
+    bool encoder_has_pending_input, bool telemetry_has_pending_encode) noexcept {
+  return encoder_has_pending_input || telemetry_has_pending_encode;
+}
+
+[[nodiscard]] constexpr bool ShouldYieldAfterPendingEncodeNoProgress(
+    HRESULT initial_encode_result, HRESULT capture_result,
+    bool capture_was_skipped_for_pending) noexcept {
+  return initial_encode_result == S_FALSE && capture_result == S_FALSE &&
+         capture_was_skipped_for_pending;
+}
+
 // Owns the capture -> latest-only -> GPU conversion -> hardware encode path.
 // Network transport remains outside this boundary and reports congestion through
 // NotifyTransportWouldBlock() before it can discard any AVC reference frame.
@@ -23,6 +56,9 @@ class VideoPipeline final {
                               VideoTelemetrySink* telemetry = nullptr);
   void Stop();
   [[nodiscard]] HRESULT CaptureOnce(DWORD timeout_ms);
+  [[nodiscard]] bool has_pending_encode() const noexcept {
+    return HasInFlightEncode();
+  }
   // Pumps an asynchronous encoder before consuming another captured frame.
   // This prevents a pending raw frame from being discarded while hardware is
   // still working on the preceding access unit.
@@ -43,6 +79,10 @@ class VideoPipeline final {
   }
 
  private:
+  [[nodiscard]] bool HasInFlightEncode() const noexcept {
+    return HasInFlightEncodeState(encoder_.HasPendingInput(), pending_encode_.has_pending());
+  }
+
   [[nodiscard]] HRESULT CompleteEncodedFrame(EncodedAccessUnit& output);
   [[nodiscard]] HRESULT ResetEncoderAndRequestIdr(bool notify_telemetry);
   void ReportPolicy(const ResolutionPolicyObservation& observation,

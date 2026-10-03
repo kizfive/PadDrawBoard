@@ -17,7 +17,7 @@ class AppState {
     @Volatile private var value = ClientState()
     private val listeners = CopyOnWriteArrayList<(ClientState) -> Unit>()
     fun snapshot(): ClientState = value
-    fun update(transform: (ClientState) -> ClientState) {
+    @Synchronized fun update(transform: (ClientState) -> ClientState) {
         value = transform(value)
         listeners.forEach { it(value) }
     }

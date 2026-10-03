@@ -1,4 +1,5 @@
 #include "pdb/input/input_system.h"
+#include "pdb/input/touch_grouping.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -90,7 +91,9 @@ bool InputSystem::Process(const InputFrame& frame) {
       touchesSuppressed_ = false;
       return false;  // stale orientation and black-bar input both cancel safely.
     }
-    palmGuard_.ObservePen(pen.inRange, pen.timestamp);
+    const bool pen_tip_down = pen.phase == PointerPhase::kDown ||
+                              pen.phase == PointerPhase::kMove;
+    palmGuard_.ObservePen(pen_tip_down, pen.timestamp);
     ApplyProfileButtons(pen);
     if (palmRejectionEnabled_ && !palmGuard_.AllowsTouch(pen.timestamp)) {
       if (!touchesSuppressed_) injector_.ReleaseTouches();
@@ -99,26 +102,33 @@ bool InputSystem::Process(const InputFrame& frame) {
     success = injector_.InjectPen(pen, *point, effectiveEraser_) && success;
   }
 
-  std::vector<TouchSample> allowedSamples;
-  std::vector<MappedPoint> points;
-  allowedSamples.reserve(std::min<std::size_t>(frame.touches.size(), 10));
-  points.reserve(std::min<std::size_t>(frame.touches.size(), 10));
-  for (const TouchSample& touch : frame.touches) {
-    if (allowedSamples.size() == 10) break;
-    const auto point = mapper_.Map(touch.position, touch.orientationEpoch);
-    if (!point.has_value()) {
-      injector_.ReleaseTouches();
-      return false;
+  std::size_t begin = 0;
+  while (begin < frame.touches.size()) {
+    const std::size_t end = NextTouchInjectionGroupEnd(frame.touches, begin);
+    std::vector<TouchSample> allowedSamples;
+    std::vector<MappedPoint> points;
+    allowedSamples.reserve(end - begin);
+    points.reserve(end - begin);
+    for (std::size_t index = begin; index < end; ++index) {
+      const TouchSample& touch = frame.touches[index];
+      const auto point = mapper_.Map(touch.position, touch.orientationEpoch);
+      if (!point.has_value()) {
+        injector_.ReleaseTouches();
+        return false;
+      }
+      if (palmRejectionEnabled_ && !palmGuard_.AllowsTouch(touch.timestamp)) {
+        touchesSuppressed_ = true;
+        continue;
+      }
+      touchesSuppressed_ = false;
+      allowedSamples.push_back(touch);
+      points.push_back(*point);
     }
-    if (palmRejectionEnabled_ && !palmGuard_.AllowsTouch(touch.timestamp)) {
-      touchesSuppressed_ = true;
-      continue;
+    if (!allowedSamples.empty()) {
+      success = injector_.InjectTouches(allowedSamples, points) && success;
     }
-    touchesSuppressed_ = false;
-    allowedSamples.push_back(touch);
-    points.push_back(*point);
+    begin = end;
   }
-  if (!allowedSamples.empty()) success = injector_.InjectTouches(allowedSamples, points) && success;
   return success;
 }
 

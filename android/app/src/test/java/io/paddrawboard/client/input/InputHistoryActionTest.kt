@@ -18,4 +18,11 @@ class InputHistoryActionTest {
         assertEquals(CapturedAction.HOVER, historicalActionFor(MotionEvent.ACTION_HOVER_MOVE))
         assertEquals(CapturedAction.HOVER, historicalActionFor(MotionEvent.ACTION_HOVER_EXIT))
     }
+
+    @Test fun pointerTransitionsOnlyApplyToTheActionPointer() {
+        assertEquals(CapturedAction.MOVE, actionForPointer(MotionEvent.ACTION_POINTER_DOWN, 0, 1))
+        assertEquals(CapturedAction.DOWN, actionForPointer(MotionEvent.ACTION_POINTER_DOWN, 1, 1))
+        assertEquals(CapturedAction.MOVE, actionForPointer(MotionEvent.ACTION_POINTER_UP, 0, 1))
+        assertEquals(CapturedAction.UP, actionForPointer(MotionEvent.ACTION_POINTER_UP, 1, 1))
+    }
 }

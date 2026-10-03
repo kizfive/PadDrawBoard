@@ -2,6 +2,7 @@
 
 #include "pdb/video/monitor_enumerator.h"
 
+#include <d3d10.h>
 #include <d3d11.h>
 
 #include <cwchar>
@@ -20,12 +21,30 @@ D3D11_TEXTURE2D_DESC NormalizePrivateCopyTextureDesc(
   return desc;
 }
 
+bool ShouldReusePrivateCopyTexture(const D3D11_TEXTURE2D_DESC& cached_desc,
+                                   const D3D11_TEXTURE2D_DESC& source_desc) noexcept {
+  const auto normalized = NormalizePrivateCopyTextureDesc(source_desc);
+  return cached_desc.Width == normalized.Width && cached_desc.Height == normalized.Height &&
+         cached_desc.MipLevels == normalized.MipLevels &&
+         cached_desc.ArraySize == normalized.ArraySize &&
+         cached_desc.Format == normalized.Format &&
+         cached_desc.SampleDesc.Count == normalized.SampleDesc.Count &&
+         cached_desc.SampleDesc.Quality == normalized.SampleDesc.Quality &&
+         cached_desc.Usage == normalized.Usage &&
+         cached_desc.BindFlags == normalized.BindFlags &&
+         cached_desc.CPUAccessFlags == normalized.CPUAccessFlags &&
+         cached_desc.MiscFlags == normalized.MiscFlags;
+}
+
 DesktopDuplicationCapture::~DesktopDuplicationCapture() { Close(); }
 
 HRESULT DesktopDuplicationCapture::Open(const MonitorInfo& monitor) {
   std::scoped_lock lock(mutex_);
   duplication_.Reset();
   output_.Reset();
+  private_copy_texture_.Reset();
+  private_copy_desc_ = {};
+  private_copy_desc_valid_ = false;
   context_.Reset();
   device_.Reset();
   size_ = {};
@@ -71,6 +90,21 @@ HRESULT DesktopDuplicationCapture::OpenLocked(const MonitorInfo& monitor) {
   }
   if (FAILED(hr)) return hr;
 
+  // Desktop Duplication, the D3D11 video processor, and the asynchronous
+  // Media Foundation encoder share this device.  Enable the D3D11 runtime's
+  // multithread protection before exposing the device to any of them.
+  ComPtr<ID3D10Multithread> multithread;
+  hr = device_.As(&multithread);
+  if (FAILED(hr)) {
+    context_.Reset();
+    device_.Reset();
+    return hr;
+  }
+  // SetMultithreadProtected returns the previous protection state, not an
+  // HRESULT or success flag.  A false return value is therefore expected
+  // when protection was previously disabled.
+  (void)multithread->SetMultithreadProtected(TRUE);
+
   ComPtr<IDXGIOutput> base_output;
   for (UINT output_index = 0;; ++output_index) {
     ComPtr<IDXGIOutput> candidate;
@@ -95,6 +129,9 @@ void DesktopDuplicationCapture::Close() {
   std::scoped_lock lock(mutex_);
   duplication_.Reset();
   output_.Reset();
+  private_copy_texture_.Reset();
+  private_copy_desc_ = {};
+  private_copy_desc_valid_ = false;
   context_.Reset();
   device_.Reset();
   size_ = {};
@@ -107,6 +144,9 @@ HRESULT DesktopDuplicationCapture::RecoverLocked() {
   if (FAILED(hr)) return hr;
   duplication_.Reset();
   output_.Reset();
+  private_copy_texture_.Reset();
+  private_copy_desc_ = {};
+  private_copy_desc_valid_ = false;
   context_.Reset();
   device_.Reset();
   size_ = {};
@@ -118,9 +158,18 @@ HRESULT DesktopDuplicationCapture::CreateCopyTextureLocked(const D3D11_TEXTURE2D
   if (texture == nullptr) return E_POINTER;
   const D3D11_TEXTURE2D_DESC desc = NormalizePrivateCopyTextureDesc(source_desc);
   texture->Reset();
-  HRESULT hr = device_->CreateTexture2D(&desc, nullptr, texture->GetAddressOf());
-  if (SUCCEEDED(hr)) size_ = {desc.Width, desc.Height};
-  return hr;
+  if (!private_copy_texture_ || !private_copy_desc_valid_ ||
+      !ShouldReusePrivateCopyTexture(private_copy_desc_, source_desc)) {
+    ComPtr<ID3D11Texture2D> replacement;
+    const HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &replacement);
+    if (FAILED(hr)) return hr;
+    private_copy_texture_ = std::move(replacement);
+    private_copy_desc_ = desc;
+    private_copy_desc_valid_ = true;
+  }
+  *texture = private_copy_texture_;
+  size_ = {desc.Width, desc.Height};
+  return S_OK;
 }
 
 CaptureResult DesktopDuplicationCapture::AcquireLatest(CapturedFrame* frame, DWORD timeout_ms,
@@ -162,7 +211,9 @@ CaptureResult DesktopDuplicationCapture::AcquireLatest(CapturedFrame* frame, DWO
     hr = CreateCopyTextureLocked(source_desc, &private_copy);
     if (SUCCEEDED(hr)) {
       context_->CopyResource(private_copy.Get(), desktop_texture.Get());
-      frame->texture = std::move(private_copy);
+      // The caller serializes capture/conversion with the asynchronous encoder:
+      // no consumer still reads this texture when the next capture overwrites it.
+      frame->texture = private_copy;
       frame->size = size_;
       frame->sequence = ++sequence_;
       frame->acquired_at = std::chrono::steady_clock::now();

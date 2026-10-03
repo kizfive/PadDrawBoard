@@ -95,7 +95,7 @@ FrameIoResult FramedStream::WriteFrame(IByteStream& stream,
 FrameIoResult ResumableFrameWriter::Start(const paddrawboard::protocol::Frame& frame) {
   if (pending()) return {IoStatus::kError, 0, "another protocol frame is already pending"};
   try {
-    bytes_ = paddrawboard::protocol::encodeFrame(frame);
+    paddrawboard::protocol::encodeFrame(frame, bytes_, payload_scratch_);
     offset_ = 0;
     return {IoStatus::kOk, 0, {}};
   } catch (const std::exception& error) {

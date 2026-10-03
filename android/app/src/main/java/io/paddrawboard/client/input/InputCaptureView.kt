@@ -19,7 +19,12 @@ class InputCaptureView(
     private val capabilityTracker = CapabilityTracker(capabilitySink)
     private var pressedButtons = 0
     private var lastStylusSample: CapturedInputSample? = null
-    init { isFocusableInTouchMode = true; requestFocus() }
+    init {
+        isFocusableInTouchMode = true
+        isClickable = true
+        setOnTouchListener { _, event -> captureMotionEvent(event) }
+        requestFocus()
+    }
 
     fun initializeCapabilities(bits: Long) = capabilityTracker.initialize(bits)
     fun currentCapabilityBits(): Long = capabilityTracker.currentBits()
@@ -36,8 +41,9 @@ class InputCaptureView(
         return cancelled
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean = capture(event)
-    override fun onGenericMotionEvent(event: MotionEvent): Boolean = capture(event)
+    fun captureMotionEvent(event: MotionEvent): Boolean = capture(event)
+    override fun onTouchEvent(event: MotionEvent): Boolean = captureMotionEvent(event)
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean = captureMotionEvent(event)
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         val button = if (StylusButtonMapping.isSupportedKeyEvent(event)) StylusButtonMapping.fromKeyCode(keyCode) else 0
         if (button == 0) return super.onKeyDown(keyCode, event)
@@ -66,7 +72,7 @@ class InputCaptureView(
     }
 
     private fun capture(event: MotionEvent): Boolean {
-        val action = actionOf(event.actionMasked) ?: return false
+        actionOf(event.actionMasked) ?: return false
         val stylusTool = event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS || event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
         val isHoverAction = event.actionMasked == MotionEvent.ACTION_HOVER_ENTER ||
             event.actionMasked == MotionEvent.ACTION_HOVER_MOVE || event.actionMasked == MotionEvent.ACTION_HOVER_EXIT
@@ -83,7 +89,9 @@ class InputCaptureView(
         for (history in 0 until event.historySize) for (index in 0 until event.pointerCount) {
             appendSample(samples, event, index, historicalAction, event.getHistoricalEventTime(history), history)
         }
-        for (index in 0 until event.pointerCount) appendSample(samples, event, index, action, event.eventTime, -1)
+        for (index in 0 until event.pointerCount) {
+            appendSample(samples, event, index, actionForPointer(event.actionMasked, index, event.actionIndex), event.eventTime, -1)
+        }
         if (samples.isNotEmpty()) sink(samples)
         return true
     }
@@ -91,7 +99,13 @@ class InputCaptureView(
         val tool = toolOf(event.getToolType(index))
         if (tool == CapturedTool.FINGER && palm.suppressTouch(time)) return
         if (tool != CapturedTool.FINGER) {
-            if (event.actionMasked == MotionEvent.ACTION_HOVER_EXIT || action == CapturedAction.CANCEL) palm.stylusLeftRange(time) else palm.stylusObserved(time)
+            if (action == CapturedAction.DOWN || action == CapturedAction.MOVE) {
+                palm.stylusObserved(time)
+            } else {
+                // Some Xiaomi styluses never emit HOVER_EXIT. UP and hover must
+                // therefore release touch suppression instead of latching it.
+                palm.stylusLeftRange(time)
+            }
         }
         fun axis(axis: Int): Float = if (history >= 0) event.getHistoricalAxisValue(axis, index, history) else event.getAxisValue(axis, index)
         fun coordinate(x: Boolean): Float = if (history >= 0) if (x) event.getHistoricalX(index, history) else event.getHistoricalY(index, history) else if (x) event.getX(index) else event.getY(index)
@@ -120,5 +134,16 @@ class InputCaptureView(
 /** Historical MotionEvent records describe movement leading up to the current record. */
 internal fun historicalActionFor(actionMasked: Int): CapturedAction = when (actionMasked) {
     MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_EXIT -> CapturedAction.HOVER
+    else -> CapturedAction.MOVE
+}
+
+internal fun actionForPointer(actionMasked: Int, pointerIndex: Int, actionIndex: Int): CapturedAction = when (actionMasked) {
+    MotionEvent.ACTION_DOWN -> CapturedAction.DOWN
+    MotionEvent.ACTION_UP -> CapturedAction.UP
+    MotionEvent.ACTION_POINTER_DOWN -> if (pointerIndex == actionIndex) CapturedAction.DOWN else CapturedAction.MOVE
+    MotionEvent.ACTION_POINTER_UP -> if (pointerIndex == actionIndex) CapturedAction.UP else CapturedAction.MOVE
+    MotionEvent.ACTION_MOVE -> CapturedAction.MOVE
+    MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_EXIT -> CapturedAction.HOVER
+    MotionEvent.ACTION_CANCEL -> CapturedAction.CANCEL
     else -> CapturedAction.MOVE
 }

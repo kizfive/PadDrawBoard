@@ -97,6 +97,7 @@ void VideoPipeline::ReportPolicy(const ResolutionPolicyObservation& observation,
 
 HRESULT VideoPipeline::CaptureOnce(DWORD timeout_ms) {
   last_failure_stage_ = "capture";
+  if (!ShouldAttemptDesktopCapture(HasInFlightEncode())) return S_FALSE;
   CapturedFrame frame;
   HRESULT failure = S_OK;
   const auto started = std::chrono::steady_clock::now();
@@ -119,7 +120,7 @@ HRESULT VideoPipeline::CaptureOnce(DWORD timeout_ms) {
 HRESULT VideoPipeline::EncodeLatest(EncodedAccessUnit* output) {
   last_failure_stage_ = "encode_argument";
   if (output == nullptr) return E_POINTER;
-  *output = {};
+  ResetEncodedAccessUnit(*output);
 
   // Async hardware MFTs can complete independently of the capture cadence.
   // Poll before consuming a raw frame so the one-slot latest-frame queue keeps
@@ -170,6 +171,10 @@ HRESULT VideoPipeline::EncodeLatest(EncodedAccessUnit* output) {
       return hr;
     }
     encode_size_ = requested_size;
+    if (telemetry_) {
+      telemetry_->OnEncoderSelected(encoder_.selected_name(),
+                                    encoder_.is_asynchronous());
+    }
     // Initialize() already performs the single formal stream reset and IDR
     // request. A second reset here can flush the freshly negotiated MFT again
     // immediately before the first ProcessInput.
@@ -188,7 +193,8 @@ HRESULT VideoPipeline::EncodeLatest(EncodedAccessUnit* output) {
   ComPtr<ID3D11Texture2D> nv12;
   const auto conversion_started = std::chrono::steady_clock::now();
   last_failure_stage_ = "convert_bgra_to_nv12";
-  HRESULT hr = converter_.Convert(frame->texture.Get(), encode_size_, &nv12);
+  HRESULT hr = converter_.Convert(frame->texture.Get(), encode_size_,
+                                  encoder_.can_reuse_input_texture(), &nv12);
   if (FAILED(hr)) {
     last_failure_stage_ += "/";
     last_failure_stage_ += converter_.last_failure_stage();

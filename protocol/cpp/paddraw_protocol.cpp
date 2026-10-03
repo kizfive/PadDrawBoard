@@ -10,6 +10,7 @@ namespace {
 
 class Writer {
  public:
+  explicit Writer(std::vector<std::uint8_t>& bytes) : bytes_(bytes) { bytes_.clear(); }
   void u8(std::uint8_t value) { bytes_.push_back(value); }
   void u16(std::uint16_t value) { u8(static_cast<std::uint8_t>(value)); u8(static_cast<std::uint8_t>(value >> 8)); }
   void u32(std::uint32_t value) { for (int i = 0; i < 4; ++i) u8(static_cast<std::uint8_t>(value >> (8 * i))); }
@@ -19,7 +20,6 @@ class Writer {
   void string(const std::string& value) {
     append(reinterpret_cast<const std::uint8_t*>(value.data()), value.size());
   }
-  std::vector<std::uint8_t> take() { return std::move(bytes_); }
  private:
   void append(const std::uint8_t* data, std::size_t size) {
     if (size > bytes_.max_size() - bytes_.size()) throw std::length_error("protocol output too large");
@@ -27,7 +27,7 @@ class Writer {
     for (std::size_t i = 0; i < size; ++i) bytes_.push_back(data[i]);
   }
 
-  std::vector<std::uint8_t> bytes_;
+  std::vector<std::uint8_t>& bytes_;
 };
 
 class Reader {
@@ -107,7 +107,8 @@ void validateControl(const Control& control) {
 
 std::vector<std::uint8_t> encodeControl(const Control& control) {
   validateControl(control);
-  Writer body;
+  std::vector<std::uint8_t> bodyBytes;
+  Writer body(bodyBytes);
   ControlOpcode opcode{};
   std::visit([&](const auto& value) {
     using T = std::decay_t<decltype(value)>;
@@ -120,12 +121,17 @@ std::vector<std::uint8_t> encodeControl(const Control& control) {
     else if constexpr (std::is_same_v<T, Telemetry>) { opcode = ControlOpcode::Telemetry; body.u32(value.rttUs); body.u32(value.videoLatencyUs); body.u32(value.droppedVideoFrames); }
     else if constexpr (std::is_same_v<T, Disconnect>) { opcode = ControlOpcode::Disconnect; body.u16(value.reason); body.u16(static_cast<std::uint16_t>(value.message.size())); body.string(value.message); }
   }, control);
-  auto bodyBytes = body.take();
-  Writer result; result.u16(static_cast<std::uint16_t>(opcode)); result.u16(static_cast<std::uint16_t>(bodyBytes.size())); result.bytes(bodyBytes); return result.take();
+  std::vector<std::uint8_t> resultBytes;
+  Writer result(resultBytes);
+  result.u16(static_cast<std::uint16_t>(opcode));
+  result.u16(static_cast<std::uint16_t>(bodyBytes.size()));
+  result.bytes(bodyBytes);
+  return resultBytes;
 }
 
-std::vector<std::uint8_t> encodePayload(const Payload& payload, MessageType& type) {
-  Writer w;
+void encodePayload(const Payload& payload, MessageType& type,
+                   std::vector<std::uint8_t>& output) {
+  Writer w(output);
   std::visit([&](const auto& value) {
     using T = std::decay_t<decltype(value)>;
     if constexpr (std::is_same_v<T, ClientHello>) { type = MessageType::ClientHello; validateHello(value); w.u32(value.capabilities); w.u16(value.displayWidth); w.u16(value.displayHeight); w.u16(value.rotationDegrees); w.u16(value.maxTouchContacts); w.u16(value.maxPenPressure); w.u16(value.videoCodecMask); w.u32(value.maxVideoWidth); w.u32(value.maxVideoHeight); w.u16(static_cast<std::uint16_t>(value.deviceName.size())); w.u16(static_cast<std::uint16_t>(value.osName.size())); w.string(value.deviceName); w.string(value.osName); }
@@ -134,7 +140,6 @@ std::vector<std::uint8_t> encodePayload(const Payload& payload, MessageType& typ
     else if constexpr (std::is_same_v<T, InputBatch>) { type = MessageType::InputBatch; validateInput(value); w.u64(value.batchTimestampNs); w.u16(static_cast<std::uint16_t>(value.samples.size())); w.u16(0); for (const auto& s : value.samples) { w.u32(s.timestampDeltaUs); w.u16(s.pointerId); w.u8(static_cast<std::uint8_t>(s.tool)); w.u8(s.contactFlags); w.u16(s.x); w.u16(s.y); w.u16(s.pressure); w.i16(s.tiltX); w.i16(s.tiltY); w.u16(s.distance); w.u16(s.buttons); } }
     else if constexpr (std::is_same_v<T, Control>) { type = MessageType::Control; auto bytes = encodeControl(value); w.bytes(bytes); }
   }, payload);
-  return w.take();
 }
 
 Result<Payload> decodePayload(MessageType type, const std::uint8_t* bytes, std::size_t size) {
@@ -182,11 +187,22 @@ Result<Payload> decodePayload(MessageType type, const std::uint8_t* bytes, std::
 }  // namespace
 
 std::vector<std::uint8_t> encodeFrame(const Frame& frame) {
+  std::vector<std::uint8_t> output;
+  std::vector<std::uint8_t> payload_scratch;
+  encodeFrame(frame, output, payload_scratch);
+  return output;
+}
+
+void encodeFrame(const Frame& frame, std::vector<std::uint8_t>& frame_output,
+                 std::vector<std::uint8_t>& payload_scratch) {
+  frame_output.clear();
+  payload_scratch.clear();
   MessageType payloadType{};
-  auto payload = encodePayload(frame.payload, payloadType);
+  encodePayload(frame.payload, payloadType, payload_scratch);
   check(frame.header.type == payloadType && allowedFlags(frame.header.type, frame.header.flags), "header and payload mismatch");
-  check(payload.size() <= kMaxPayloadBytes, "payload too large");
-  Writer writer; writer.u32(kMagic); writer.u16(kVersion); writer.u16(static_cast<std::uint16_t>(frame.header.type)); writer.u32(frame.header.flags); writer.u32(frame.header.sequence); writer.u32(static_cast<std::uint32_t>(payload.size())); writer.bytes(payload); return writer.take();
+  check(payload_scratch.size() <= kMaxPayloadBytes, "payload too large");
+  Writer writer(frame_output);
+  writer.u32(kMagic); writer.u16(kVersion); writer.u16(static_cast<std::uint16_t>(frame.header.type)); writer.u32(frame.header.flags); writer.u32(frame.header.sequence); writer.u32(static_cast<std::uint32_t>(payload_scratch.size())); writer.bytes(payload_scratch);
 }
 
 Result<Frame> decodeFrame(const std::uint8_t* bytes, std::size_t size) {

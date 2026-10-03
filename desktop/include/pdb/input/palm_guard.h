@@ -6,19 +6,20 @@
 
 namespace pdb::input {
 
-// Suppresses fingers while the pen is in range, and for a short tail after it leaves.
+// Suppresses fingers only while the pen tip is down. Hover must not latch touch
+// suppression because some Android styluses never report a range-exit event.
 class PalmGuard final {
  public:
-  explicit PalmGuard(std::chrono::milliseconds releaseDelay = std::chrono::milliseconds{150});
+  explicit PalmGuard(std::chrono::milliseconds releaseDelay = std::chrono::milliseconds{0});
 
-  void ObservePen(bool inRange, std::chrono::steady_clock::time_point now) noexcept;
+  void ObservePen(bool tipDown, std::chrono::steady_clock::time_point now) noexcept;
   [[nodiscard]] bool AllowsTouch(std::chrono::steady_clock::time_point now) const noexcept;
   void Reset() noexcept;
 
  private:
   std::chrono::milliseconds releaseDelay_;
   std::chrono::steady_clock::time_point lastPenExit_{};
-  bool penInRange_{};
+  bool penTipDown_{};
   bool seenPen_{};
 };
 

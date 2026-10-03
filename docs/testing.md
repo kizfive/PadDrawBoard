@@ -48,11 +48,13 @@ python -m unittest discover -s tools/latency -p "test_*.py" -v
 {"kind":"glass_sample","glass_to_glass_ms":32.4}
 ```
 
-也可以根据捕获时间戳和显示/呈现时间戳计算：
+也可以根据实际测量的捕获时间戳和屏幕呈现时间戳计算，必须明确标记为 `glass_sample`：
 
 ```json
-{"kind":"video_sample","capture_timestamp_ns":1000000000,"presentation_timestamp_ns":1032400000}
+{"kind":"glass_sample","capture_timestamp_ns":1000000000,"presentation_timestamp_ns":1032400000}
 ```
+
+桌面 `video_sample.presentation_timestamp_ns` 实际表示编码完成，不能改名后充当屏幕测量；分析器不再将 `video_sample` 纳入玻璃到玻璃发布门槛。Android 的视频遥测只覆盖编码完成到接收，也不包含解码及屏幕显示。
 
 输入传输样本可以使用毫秒、微秒或发送/接收时间戳：
 

@@ -2,6 +2,7 @@
 #include "pdb/app/desktop_server.h"
 #include "pdb/app/tray_commands.h"
 #include "pdb/video/monitor_enumerator.h"
+#include "resource.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -21,6 +22,7 @@ constexpr UINT_PTR kTrayIconId = 1;
 struct TrayContext {
   std::unique_ptr<pdb::app::DesktopServer> server;
   NOTIFYICONDATAW icon{};
+  HICON app_icon{};
   bool icon_added{};
   std::vector<pdb::video::MonitorInfo> menu_monitors;
 };
@@ -50,7 +52,7 @@ std::wstring InstanceMutexName() {
 std::wstring Utf8ToWide(std::string_view text) {
   if (text.empty()) return {};
   const int count = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-  if (count <= 0) return L"(unavailable)";
+  if (count <= 0) return L"（不可用）";
   std::wstring result(static_cast<std::size_t>(count), L'\0');
   MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), count);
   return result;
@@ -70,7 +72,6 @@ TrayContext* Context(HWND window) {
 void UpdateTooltip(TrayContext& context) {
   const pdb::app::ServerStatus status = context.server->Status();
   std::wstring tip = L"PadDrawBoard — " + pdb::app::ServerPhaseText(status.phase);
-  if (!status.diagnostic.empty()) tip += L": " + Utf8ToWide(status.diagnostic);
   tip = TrimForMenu(std::move(tip), _countof(context.icon.szTip) - 1);
   wcsncpy_s(context.icon.szTip, tip.c_str(), _TRUNCATE);
   context.icon.uFlags = NIF_TIP;
@@ -82,31 +83,21 @@ void ShowStatusMenu(HWND window, TrayContext& context) {
   const pdb::app::AppConfig config = context.server->CurrentConfig();
   HMENU menu = CreatePopupMenu();
   if (menu == nullptr) return;
-  const std::wstring phase = L"State: " + pdb::app::ServerPhaseText(status.phase);
-  const std::wstring channels = L"Channels: control=" + std::wstring(status.control_connected ? L"yes" : L"no") +
-      L", video=" + std::wstring(status.video_connected ? L"yes" : L"no") +
-      L", input=" + std::wstring(status.input_connected ? L"yes" : L"no");
-  const std::wstring video = L"Video: " + std::to_wstring(status.video_frames_sent) +
-      L" frames, " + std::to_wstring(status.stream_resets) + L" reset(s)";
-  const std::wstring latency = L"Client telemetry: RTT " + std::to_wstring(status.client_rtt_us) +
-      L" μs, video " + std::to_wstring(status.client_video_latency_us) + L" μs";
-  const std::wstring injection = L"Windows Ink injection: " +
-      std::wstring(status.input_injection_available ? L"available" : L"unavailable");
-  const std::wstring buttons = L"Pen buttons confirmed: " +
-      std::wstring(status.pen_buttons_confirmed ? L"yes" : L"no");
-  const std::wstring readiness = L"Release ready: " +
-      std::wstring(status.release_ready ? L"yes" : L"no");
-  const std::wstring probe = L"Probe: " + Utf8ToWide(
-      status.input_probe_diagnostic.empty() ? "not run" : status.input_probe_diagnostic);
+  const std::wstring phase = L"状态：" + pdb::app::ServerPhaseText(status.phase);
+  const std::wstring channels = L"连接：控制 " + std::wstring(status.control_connected ? L"正常" : L"断开") +
+      L"｜画面 " + std::wstring(status.video_connected ? L"正常" : L"断开") +
+      L"｜输入 " + std::wstring(status.input_connected ? L"正常" : L"断开");
+  const std::wstring video = L"画面：已发送 " + std::to_wstring(status.video_frames_sent) +
+      L" 帧｜重置 " + std::to_wstring(status.stream_resets) + L" 次";
+  const std::wstring latency = L"延迟：连接 " + std::to_wstring(status.client_rtt_us / 1000) +
+      L" 毫秒｜画面 " + std::to_wstring(status.client_video_latency_us / 1000) + L" 毫秒";
+  const std::wstring injection = L"Windows Ink 输入：" +
+      std::wstring(status.input_injection_available ? L"可用" : L"不可用");
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, phase.c_str());
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, channels.c_str());
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, video.c_str());
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, latency.c_str());
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, injection.c_str());
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, buttons.c_str());
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, readiness.c_str());
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, TrimForMenu(probe).c_str());
-  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, TrimForMenu(Utf8ToWide(status.diagnostic)).c_str());
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
   context.menu_monitors.clear();
@@ -114,7 +105,7 @@ void ShowStatusMenu(HWND window, TrayContext& context) {
   HMENU monitor_menu = CreatePopupMenu();
   if (monitor_menu != nullptr) {
     if (context.menu_monitors.empty()) {
-      AppendMenuW(monitor_menu, MF_STRING | MF_GRAYED, 0, L"No capturable monitors");
+      AppendMenuW(monitor_menu, MF_STRING | MF_GRAYED, 0, L"没有可捕获的显示器");
     } else {
       for (std::size_t index = 0; index < context.menu_monitors.size(); ++index) {
         const auto& monitor = context.menu_monitors[index];
@@ -127,7 +118,7 @@ void ShowStatusMenu(HWND window, TrayContext& context) {
                     static_cast<UINT_PTR>(pdb::app::TrayMonitorCommand(index)), label.c_str());
       }
     }
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(monitor_menu), L"Monitor");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(monitor_menu), L"显示器");
   }
 
   HMENU bitrate_menu = CreatePopupMenu();
@@ -138,16 +129,20 @@ void ShowStatusMenu(HWND window, TrayContext& context) {
                   static_cast<UINT_PTR>(pdb::app::TrayBitrateCommand(bitrate)),
                   (std::to_wstring(bitrate) + L" Mbps").c_str());
     }
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(bitrate_menu), L"Bitrate");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(bitrate_menu), L"画质（码率）");
   }
   AppendMenuW(menu, MF_STRING | (config.palm_guard_enabled ? MF_CHECKED : 0),
-              pdb::app::kTrayTogglePalmCommand, L"Palm guard");
+              pdb::app::kTrayTogglePalmCommand, L"笔尖接触时防误触");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(menu, MF_STRING, pdb::app::kTrayOpenConfigCommand, L"Open config folder");
-  AppendMenuW(menu, MF_STRING, pdb::app::kTrayOpenTelemetryCommand, L"Open telemetry");
-  AppendMenuW(menu, MF_STRING, pdb::app::kTrayExportTelemetryCommand, L"Export telemetry...");
+  HMENU diagnostic_menu = CreatePopupMenu();
+  if (diagnostic_menu != nullptr) {
+    AppendMenuW(diagnostic_menu, MF_STRING, pdb::app::kTrayOpenConfigCommand, L"打开配置文件夹");
+    AppendMenuW(diagnostic_menu, MF_STRING, pdb::app::kTrayOpenTelemetryCommand, L"打开运行日志");
+    AppendMenuW(diagnostic_menu, MF_STRING, pdb::app::kTrayExportTelemetryCommand, L"导出运行日志…");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(diagnostic_menu), L"诊断工具");
+  }
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(menu, MF_STRING, pdb::app::kTrayExitCommand, L"Exit PadDrawBoard");
+  AppendMenuW(menu, MF_STRING, pdb::app::kTrayExitCommand, L"退出 PadDrawBoard");
   POINT point{};
   GetCursorPos(&point);
   SetForegroundWindow(window);
@@ -164,7 +159,7 @@ void ShowExportDialog(HWND window, TrayContext& context) {
   OPENFILENAMEW dialog{};
   dialog.lStructSize = sizeof(dialog);
   dialog.hwndOwner = window;
-  dialog.lpstrFilter = L"JSON Lines (*.jsonl)\0*.jsonl\0All files (*.*)\0*.*\0";
+  dialog.lpstrFilter = L"JSON Lines 日志 (*.jsonl)\0*.jsonl\0所有文件 (*.*)\0*.*\0";
   dialog.lpstrFile = filename;
   dialog.nMaxFile = _countof(filename);
   dialog.lpstrDefExt = L"jsonl";
@@ -172,7 +167,7 @@ void ShowExportDialog(HWND window, TrayContext& context) {
   if (GetSaveFileNameW(&dialog) == FALSE) return;
   std::string error;
   if (!context.server->ExportTelemetry(filename, &error)) {
-    MessageBoxW(window, Utf8ToWide(error).c_str(), L"PadDrawBoard telemetry export",
+    MessageBoxW(window, Utf8ToWide(error).c_str(), L"PadDrawBoard 日志导出失败",
                 MB_OK | MB_ICONERROR);
   }
 }
@@ -180,7 +175,7 @@ void ShowExportDialog(HWND window, TrayContext& context) {
 bool ApplyTrayConfig(HWND window, TrayContext& context, pdb::app::AppConfig config) {
   std::string error;
   if (context.server->Reconfigure(std::move(config), &error)) return true;
-  MessageBoxW(window, Utf8ToWide(error).c_str(), L"PadDrawBoard configuration",
+  MessageBoxW(window, Utf8ToWide(error).c_str(), L"PadDrawBoard 配置失败",
               MB_OK | MB_ICONERROR);
   return false;
 }
@@ -239,8 +234,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         context->icon.uID = kTrayIconId;
         context->icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         context->icon.uCallbackMessage = kTrayCallbackMessage;
-        context->icon.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-        wcsncpy_s(context->icon.szTip, L"PadDrawBoard starting", _TRUNCATE);
+        context->icon.hIcon = context->app_icon;
+        wcsncpy_s(context->icon.szTip, L"PadDrawBoard 正在启动", _TRUNCATE);
         context->icon_added = Shell_NotifyIconW(NIM_ADD, &context->icon) != FALSE;
         (void)context->server->Start();
         UpdateTooltip(*context);
@@ -297,11 +292,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   options.executable_directory = ModuleDirectory();
   TrayContext context;
   context.server = std::make_unique<pdb::app::DesktopServer>(std::move(options));
+  context.app_icon = static_cast<HICON>(LoadImageW(
+      instance, MAKEINTRESOURCEW(IDI_PADDRAWBOARD), IMAGE_ICON, 0, 0,
+      LR_DEFAULTSIZE | LR_SHARED));
+  if (context.app_icon == nullptr) {
+    context.app_icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+  }
 
   const wchar_t* class_name = L"PadDrawBoardTrayWindow";
   WNDCLASSEXW window_class{};
   window_class.cbSize = sizeof(window_class);
   window_class.hInstance = instance;
+  window_class.hIcon = context.app_icon;
+  window_class.hIconSm = context.app_icon;
   window_class.lpfnWndProc = WindowProc;
   window_class.lpszClassName = class_name;
   if (RegisterClassExW(&window_class) == 0) return 1;

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -142,10 +143,15 @@ class TelemetryWriter final {
   static constexpr std::uintmax_t kMaximumBytes = 4u * 1024u * 1024u;
   static constexpr unsigned kRetainedRotations = 3;
 
-  void RotateIfNeeded(std::uintmax_t incoming_bytes);
+  [[nodiscard]] bool OpenForAppend();
+  void CloseStream() const noexcept;
+  [[nodiscard]] bool FlushStream() const noexcept;
+  [[nodiscard]] bool RotateIfNeeded(std::uintmax_t incoming_bytes);
 
   const std::filesystem::path path_;
   mutable std::mutex mutex_;
+  mutable std::ofstream output_;
+  mutable std::uintmax_t current_bytes_{};
   bool run_marker_active_{};
 };
 
